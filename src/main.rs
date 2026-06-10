@@ -10,7 +10,7 @@ const DEFAULT_EMBEDDING_URL: &str = "http://192.168.4.1:8080/v1/embeddings";
 const BATCH_SIZE: usize = 8;
 
 #[derive(Parser)]
-#[command(name = "ccsearch", about = "Hybrid semantic + keyword search over CC sessions and project docs")]
+#[command(name = "mannaminne", about = "Hybrid semantic + keyword search over the personal life-corpus (CC sessions, docs, Messenger, AI-chat, Simplenote). Invoke as `ccsearch` to scope to CC sources only.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -28,16 +28,25 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Search sessions and docs
+    /// Search the indexed corpus (scope defaults to all; `ccsearch` → CC-only)
     Search {
         /// The search query
         query: Vec<String>,
-        /// Sessions only
+        /// CC sessions only
         #[arg(short = 's', long)]
         sessions: bool,
-        /// Docs only
+        /// Project/infra docs only
         #[arg(short = 'd', long)]
         docs: bool,
+        /// Facebook Messenger threads only
+        #[arg(short = 'm', long)]
+        messenger: bool,
+        /// AI-chat archives only (ChatGPT + Claude)
+        #[arg(short = 'a', long)]
+        aichat: bool,
+        /// Simplenote notes only
+        #[arg(long)]
+        notes: bool,
         /// Keyword-only (no semantic search)
         #[arg(short = 'k', long)]
         keyword: bool,
@@ -67,6 +76,30 @@ struct IndexEntry {
 enum EntryKind {
     Session,
     Doc,
+    Messenger,
+    AiChat,
+    Note,
+}
+
+impl EntryKind {
+    /// Sources that the legacy `ccsearch` invocation searches (CC-relevant only).
+    fn cc_scope() -> Vec<EntryKind> {
+        vec![EntryKind::Session, EntryKind::Doc]
+    }
+}
+
+/// Facebook "Download Your Information" exports store UTF-8 that has been
+/// double-encoded (each original byte became a latin1 char). Reverse it:
+/// reinterpret the chars as latin1 bytes and decode as UTF-8. If any char is
+/// outside the latin1 range the string wasn't mojibaked — return it unchanged.
+fn fix_mojibake(s: &str) -> String {
+    if s.chars().all(|c| (c as u32) < 256) {
+        let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+        if let Ok(fixed) = String::from_utf8(bytes) {
+            return fixed;
+        }
+    }
+    s.to_string()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -415,7 +448,328 @@ fn discover_docs() -> Vec<(String, String, PathBuf)> {
     docs
 }
 
+// --- Messenger / AI-chat / Simplenote discovery ---
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+}
+
+fn cap_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Facebook Messenger archive: one entry per thread.
+/// `~/Projects/messenger-archive/your_activity_across_facebook/messages/inbox/<id>/message_*.json`
+fn discover_messenger() -> Vec<IndexEntry> {
+    let base = PathBuf::from(home())
+        .join("Projects/messenger-archive/your_activity_across_facebook/messages/inbox");
+    let mut out = Vec::new();
+    let dir_glob = base.join("*");
+    for dir in glob::glob(&dir_glob.to_string_lossy())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|p| p.is_dir())
+    {
+        let thread_id = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut title = String::new();
+        let mut body = String::new();
+        let mut newest: i64 = 0;
+        // message_1.json, message_2.json, ...
+        let msg_glob = dir.join("message_*.json");
+        let mut files: Vec<PathBuf> = glob::glob(&msg_glob.to_string_lossy())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        files.sort();
+        for f in &files {
+            let content = match std::fs::read_to_string(f) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let v: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if title.is_empty() {
+                if let Some(t) = v.get("title").and_then(|x| x.as_str()) {
+                    title = fix_mojibake(t);
+                }
+                if title.is_empty() {
+                    let names: Vec<String> = v
+                        .get("participants")
+                        .and_then(|p| p.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                                .map(fix_mojibake)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    title = names.join(", ");
+                }
+            }
+            if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+                for m in msgs {
+                    if let Some(ts) = m.get("timestamp_ms").and_then(|t| t.as_i64()) {
+                        if ts > newest {
+                            newest = ts;
+                        }
+                    }
+                    if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
+                        if body.chars().count() < 1600 {
+                            let who = m
+                                .get("sender_name")
+                                .and_then(|s| s.as_str())
+                                .map(fix_mojibake)
+                                .unwrap_or_default();
+                            body.push_str(&who);
+                            body.push_str(": ");
+                            body.push_str(&fix_mojibake(c));
+                            body.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        if title.is_empty() && body.trim().is_empty() {
+            continue;
+        }
+        let created = if newest > 0 {
+            // ms epoch → YYYY-MM-DD (UTC), cheap manual conversion
+            let secs = newest / 1000;
+            chrono_like_date(secs)
+        } else {
+            String::new()
+        };
+        let text = cap_chars(&format!("{title}\n{body}"), 1600);
+        out.push(IndexEntry {
+            id: format!("msg:{thread_id}"),
+            kind: EntryKind::Messenger,
+            project: "messenger".to_string(),
+            title: if title.is_empty() {
+                cap_chars(&body, 60)
+            } else {
+                title
+            },
+            text,
+            path: dir.to_string_lossy().to_string(),
+            created,
+            embedding: vec![],
+        });
+    }
+    out
+}
+
+/// Minimal epoch-seconds → "YYYY-MM-DD" (UTC). Avoids a chrono dependency.
+fn chrono_like_date(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let mut y = 1970i64;
+    let mut d = days;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dy = if leap { 366 } else { 365 };
+        if d >= dy {
+            d -= dy;
+            y += 1;
+        } else {
+            break;
+        }
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mlen = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    while m < 12 && d >= mlen[m] {
+        d -= mlen[m];
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02}", y, m + 1, d + 1)
+}
+
+/// AI-chat archives: ChatGPT (mapping format) + Claude (chat_messages format).
+fn discover_aichat() -> Vec<IndexEntry> {
+    let mut out = Vec::new();
+    let base = PathBuf::from(home()).join("Projects/ai-chat-archives");
+
+    // ChatGPT: */conversations/*.json with a `mapping` of message nodes.
+    let cg_glob = base.join("chatgpt_*/conversations/*.json");
+    for f in glob::glob(&cg_glob.to_string_lossy())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let content = match std::fs::read_to_string(&f) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let title = v.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let mut msgs: Vec<(f64, String)> = Vec::new();
+        if let Some(map) = v.get("mapping").and_then(|m| m.as_object()) {
+            for node in map.values() {
+                if let Some(msg) = node.get("message") {
+                    let ct = msg.get("create_time").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    if let Some(parts) = msg
+                        .get("content")
+                        .and_then(|c| c.get("parts"))
+                        .and_then(|p| p.as_array())
+                    {
+                        for part in parts {
+                            if let Some(s) = part.as_str() {
+                                if !s.trim().is_empty() {
+                                    msgs.push((ct, s.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        msgs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let body: String = msgs.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+        let id_part = v
+            .get("conversation_id")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+        if title.is_empty() && body.trim().is_empty() {
+            continue;
+        }
+        let text = cap_chars(&format!("{title}\n{body}"), 1600);
+        out.push(IndexEntry {
+            id: format!("aichat:cg:{id_part}"),
+            kind: EntryKind::AiChat,
+            project: "chatgpt".to_string(),
+            title: if title.is_empty() { cap_chars(&body, 60) } else { title },
+            text,
+            path: f.to_string_lossy().to_string(),
+            created: String::new(),
+            embedding: vec![],
+        });
+    }
+
+    // Claude: */conversations/*.json with `name` + `chat_messages[].text`.
+    let cl_glob = base.join("claude_*/conversations/*.json");
+    for f in glob::glob(&cl_glob.to_string_lossy())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let content = match std::fs::read_to_string(&f) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let created = v
+            .get("created_at")
+            .and_then(|c| c.as_str())
+            .map(|s| cap_chars(s, 10))
+            .unwrap_or_default();
+        let mut body = String::new();
+        if let Some(msgs) = v.get("chat_messages").and_then(|m| m.as_array()) {
+            for m in msgs {
+                if let Some(t) = m.get("text").and_then(|t| t.as_str()) {
+                    if !t.trim().is_empty() {
+                        let who = m.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+                        body.push_str(who);
+                        body.push_str(": ");
+                        body.push_str(t);
+                        body.push('\n');
+                    }
+                }
+            }
+        }
+        let uuid = v
+            .get("uuid")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+        if name.is_empty() && body.trim().is_empty() {
+            continue;
+        }
+        let text = cap_chars(&format!("{name}\n{body}"), 1600);
+        out.push(IndexEntry {
+            id: format!("aichat:cl:{uuid}"),
+            kind: EntryKind::AiChat,
+            project: "claude".to_string(),
+            title: if name.is_empty() { cap_chars(&body, 60) } else { name },
+            text,
+            path: f.to_string_lossy().to_string(),
+            created,
+            embedding: vec![],
+        });
+    }
+
+    out
+}
+
+/// Simplenote archive: one entry per .txt note.
+fn discover_notes() -> Vec<IndexEntry> {
+    let mut out = Vec::new();
+    let dir = PathBuf::from(home()).join("Documents/Simplenote Support Notes");
+    let pat = dir.join("*.txt");
+    for f in glob::glob(&pat.to_string_lossy())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let content = match std::fs::read_to_string(&f) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let name = f
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push(IndexEntry {
+            id: format!("note:{name}"),
+            kind: EntryKind::Note,
+            project: "simplenote".to_string(),
+            title: name,
+            text: cap_chars(&content, 1600),
+            path: f.to_string_lossy().to_string(),
+            created: String::new(),
+            embedding: vec![],
+        });
+    }
+    out
+}
+
 // --- Indexing ---
+
+/// Cache-or-queue an already-built batch of entries (embedding empty) into the
+/// index build. Mirrors the sessions/docs inline logic. Embeds the first 800
+/// chars of `text` (the embedder's ~512-token window); the full `text` is kept
+/// for substring/keyword matching.
+fn add_entries(
+    entries: &mut Vec<IndexEntry>,
+    texts_to_embed: &mut Vec<(usize, String)>,
+    existing: &HashMap<String, Vec<f32>>,
+    new_entries: Vec<IndexEntry>,
+) {
+    for mut e in new_entries {
+        if let Some(cached) = existing.get(&e.id) {
+            e.embedding = cached.clone();
+        } else {
+            texts_to_embed.push((entries.len(), cap_chars(&e.text, 800)));
+        }
+        entries.push(e);
+    }
+}
 
 fn build_index(force: bool) -> Result<SearchIndex, String> {
     let idx_path = index_path();
@@ -516,6 +870,21 @@ fn build_index(force: bool) -> Result<SearchIndex, String> {
         });
     }
 
+    // --- Messenger ---
+    let messenger = discover_messenger();
+    eprint!(", Messenger: {} threads", messenger.len());
+    add_entries(&mut entries, &mut texts_to_embed, &existing, messenger);
+
+    // --- AI-chat (ChatGPT + Claude) ---
+    let aichat = discover_aichat();
+    eprint!(", AI-chat: {} conversations", aichat.len());
+    add_entries(&mut entries, &mut texts_to_embed, &existing, aichat);
+
+    // --- Simplenote ---
+    let notes = discover_notes();
+    eprint!(", Notes: {} found", notes.len());
+    add_entries(&mut entries, &mut texts_to_embed, &existing, notes);
+
     // --- Batch embed new entries ---
     let new_count = texts_to_embed.len();
     if new_count > 0 {
@@ -568,7 +937,7 @@ fn build_index(force: bool) -> Result<SearchIndex, String> {
 fn load_index() -> Result<SearchIndex, String> {
     let path = index_path();
     let data =
-        std::fs::read(&path).map_err(|_| "No index found. Run `ccsearch index` first.".to_string())?;
+        std::fs::read(&path).map_err(|_| "No index found. Run `mannaminne index` first.".to_string())?;
     serde_json::from_slice(&data).map_err(|e| format!("Corrupt index: {e}"))
 }
 
@@ -577,8 +946,7 @@ fn load_index() -> Result<SearchIndex, String> {
 fn search(
     index: &SearchIndex,
     query: &str,
-    sessions_only: bool,
-    docs_only: bool,
+    scope: &Option<Vec<EntryKind>>,
     keyword_only: bool,
     limit: usize,
 ) -> Result<Vec<SearchResult>, String> {
@@ -595,12 +963,11 @@ fn search(
     let mut results: Vec<SearchResult> = Vec::new();
 
     for entry in &index.entries {
-        // Filter by scope
-        if sessions_only && entry.kind != EntryKind::Session {
-            continue;
-        }
-        if docs_only && entry.kind != EntryKind::Doc {
-            continue;
+        // Filter by scope (None = all sources)
+        if let Some(allowed) = scope {
+            if !allowed.contains(&entry.kind) {
+                continue;
+            }
         }
 
         // Keyword matching: all query terms must appear in text or title
@@ -666,6 +1033,9 @@ fn display_results(results: &[SearchResult], elapsed: std::time::Duration) {
         let kind_tag = match result.entry.kind {
             EntryKind::Session => "\x1b[36m[session]\x1b[0m",
             EntryKind::Doc => "\x1b[33m[doc]\x1b[0m",
+            EntryKind::Messenger => "\x1b[35m[msgr]\x1b[0m",
+            EntryKind::AiChat => "\x1b[34m[aichat]\x1b[0m",
+            EntryKind::Note => "\x1b[32m[note]\x1b[0m",
         };
 
         let keyword_tag = if result.keyword_match {
@@ -705,54 +1075,103 @@ fn display_results(results: &[SearchResult], elapsed: std::time::Duration) {
     }
 }
 
+fn kind_label(k: &EntryKind) -> &'static str {
+    match k {
+        EntryKind::Session => "session",
+        EntryKind::Doc => "doc",
+        EntryKind::Messenger => "messenger",
+        EntryKind::AiChat => "aichat",
+        EntryKind::Note => "note",
+    }
+}
+
 fn display_stats(index: &SearchIndex) {
-    let sessions = index
-        .entries
-        .iter()
-        .filter(|e| e.kind == EntryKind::Session)
-        .count();
-    let docs = index
-        .entries
-        .iter()
-        .filter(|e| e.kind == EntryKind::Doc)
-        .count();
+    let count_kind =
+        |k: EntryKind| index.entries.iter().filter(|e| e.kind == k).count();
     let embedded = index
         .entries
         .iter()
         .filter(|e| !e.embedding.is_empty())
         .count();
 
-    let mut projects: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut projects: HashMap<&str, usize> = HashMap::new();
     for entry in &index.entries {
-        let counts = projects.entry(&entry.project).or_insert((0, 0));
-        match entry.kind {
-            EntryKind::Session => counts.0 += 1,
-            EntryKind::Doc => counts.1 += 1,
-        }
+        *projects.entry(entry.project.as_str()).or_insert(0) += 1;
     }
 
     let index_size = std::fs::metadata(index_path())
         .map(|m| m.len() / 1024)
         .unwrap_or(0);
 
-    println!("ccsearch index stats:");
+    println!("mannaminne index stats:");
     println!("  Total entries:  {}", index.entries.len());
-    println!("  Sessions:       {sessions}");
-    println!("  Docs:           {docs}");
+    println!("  Sessions:       {}", count_kind(EntryKind::Session));
+    println!("  Docs:           {}", count_kind(EntryKind::Doc));
+    println!("  Messenger:      {}", count_kind(EntryKind::Messenger));
+    println!("  AI-chat:        {}", count_kind(EntryKind::AiChat));
+    println!("  Notes:          {}", count_kind(EntryKind::Note));
     println!("  Embedded:       {embedded}");
     println!("  Index size:     {index_size} KB");
     println!("  Embedding URL:  {}", embedding_url());
     println!();
-    println!("  By project:");
+    println!("  By project (top 20):");
 
     let mut sorted_projects: Vec<_> = projects.iter().collect();
-    sorted_projects.sort_by_key(|(_, (s, d))| std::cmp::Reverse(s + d));
-    for (project, (s, d)) in sorted_projects {
-        println!("    {project}: {s} sessions, {d} docs");
+    sorted_projects.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (project, n) in sorted_projects.iter().take(20) {
+        println!("    {project}: {n}");
     }
 }
 
 // --- Main ---
+
+/// True when the binary was invoked via the `ccsearch` alias (basename of argv0).
+fn invoked_as_ccsearch() -> bool {
+    std::env::args()
+        .next()
+        .and_then(|p| {
+            Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .map(|n| n == "ccsearch")
+        .unwrap_or(false)
+}
+
+/// Resolve the search scope. Explicit source flags win; otherwise the `ccsearch`
+/// alias restricts to CC sources (sessions + docs) while `mannaminne`/`minne`
+/// search everything (None = all sources).
+fn resolve_scope(
+    sessions: bool,
+    docs: bool,
+    messenger: bool,
+    aichat: bool,
+    notes: bool,
+) -> Option<Vec<EntryKind>> {
+    let mut v = Vec::new();
+    if sessions {
+        v.push(EntryKind::Session);
+    }
+    if docs {
+        v.push(EntryKind::Doc);
+    }
+    if messenger {
+        v.push(EntryKind::Messenger);
+    }
+    if aichat {
+        v.push(EntryKind::AiChat);
+    }
+    if notes {
+        v.push(EntryKind::Note);
+    }
+    if !v.is_empty() {
+        return Some(v); // explicit flags take precedence
+    }
+    if invoked_as_ccsearch() {
+        return Some(EntryKind::cc_scope()); // legacy ccsearch → CC sources only
+    }
+    None // mannaminne / minne → all sources
+}
 
 fn main() {
     let cli = Cli::parse();
@@ -770,6 +1189,9 @@ fn main() {
             query,
             sessions,
             docs,
+            messenger,
+            aichat,
+            notes,
             keyword,
             limit,
         }) => {
@@ -778,7 +1200,8 @@ fn main() {
                 eprintln!("Error: no query provided");
                 std::process::exit(1);
             }
-            run_search(&query_str, sessions, docs, keyword, limit);
+            let scope = resolve_scope(sessions, docs, messenger, aichat, notes);
+            run_search(&query_str, scope, keyword, limit);
         }
 
         Some(Commands::Stats) => match load_index() {
@@ -790,23 +1213,30 @@ fn main() {
         },
 
         None => {
-            // Bare `ccsearch <query>` — shorthand for search
+            // Bare `mannaminne <query>` (or `minne` / `ccsearch`) — shorthand for search.
             let query_str = cli.query.join(" ");
             if query_str.is_empty() {
-                eprintln!("Usage: ccsearch <query>        Search sessions + docs");
-                eprintln!("       ccsearch index          Build/update index");
-                eprintln!("       ccsearch stats          Show index statistics");
-                eprintln!("       ccsearch search -s <q>  Sessions only");
-                eprintln!("       ccsearch search -d <q>  Docs only");
-                eprintln!("       ccsearch search -k <q>  Keyword-only (no embeddings)");
+                eprintln!("mannaminne — semantic + keyword search over your life-corpus");
+                eprintln!("  (aliases: `minne` = all sources; `ccsearch` = CC sources only)\n");
+                eprintln!("Usage: mannaminne <query>          Search (all sources)");
+                eprintln!("       mannaminne index            Build/update index");
+                eprintln!("       mannaminne stats            Show index statistics");
+                eprintln!("       mannaminne search -s <q>    CC sessions only");
+                eprintln!("       mannaminne search -d <q>    Docs only");
+                eprintln!("       mannaminne search -m <q>    Messenger only");
+                eprintln!("       mannaminne search -a <q>    AI-chat only");
+                eprintln!("       mannaminne search --notes <q>  Simplenote only");
+                eprintln!("       mannaminne search -k <q>    Keyword-only (no embeddings)");
                 std::process::exit(0);
             }
-            run_search(&query_str, false, false, false, 10);
+            // ccsearch alias scopes to CC sources; mannaminne/minne search all.
+            let scope = resolve_scope(false, false, false, false, false);
+            run_search(&query_str, scope, false, 10);
         }
     }
 }
 
-fn run_search(query: &str, sessions_only: bool, docs_only: bool, keyword_only: bool, limit: usize) {
+fn run_search(query: &str, scope: Option<Vec<EntryKind>>, keyword_only: bool, limit: usize) {
     let index = match load_index() {
         Ok(idx) => idx,
         Err(e) => {
@@ -816,7 +1246,7 @@ fn run_search(query: &str, sessions_only: bool, docs_only: bool, keyword_only: b
     };
 
     let start = Instant::now();
-    match search(&index, query, sessions_only, docs_only, keyword_only, limit) {
+    match search(&index, query, &scope, keyword_only, limit) {
         Ok(results) => display_results(&results, start.elapsed()),
         Err(e) => {
             eprintln!("Error: {e}");

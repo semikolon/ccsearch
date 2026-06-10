@@ -1,8 +1,12 @@
 [package]
-name = "ccsearch"
-version = "0.1.0"
+name = "mannaminne"
+version = "0.2.0"
 edition = "2021"
-description = "Hybrid semantic + keyword search over Claude Code sessions and project docs"
+description = "Hybrid semantic + keyword search over the personal life-corpus: CC sessions, project docs, Messenger, AI-chat archives, Simplenote. ('i mannaminne' = in living memory.)"
+
+[[bin]]
+name = "mannaminne"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
