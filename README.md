@@ -8,6 +8,14 @@ Built in Rust. Uses the local Darwin embedding server (Qwen3-Embedding-4B on the
 GTX 1650) for semantic search; plain substring matching for keyword search. Was
 `ccsearch` (CC-sessions-only) through 2026-06; renamed + extended 2026-06-10.
 
+> **🚩 v2 in progress (2026-06-10):** the in-memory binary index documented below
+> is being superseded by a **Postgres + pgvector store on Darwin** with full-corpus
+> coverage (no truncation), Postgres FTS for guaranteed any-exact-needle keyword
+> search, and pgvector for semantic — because the in-memory design can't hold the
+> fully-chunked corpus (100k–700k+ chunks). Architecture + rationale:
+> `~/dotfiles/docs/personal_archives_semantic_search_2026_06_10.md` § v2 pivot.
+> The Rust in-memory tool below remains the interim CC-only search until v2 lands.
+
 ## Names / scope
 
 | Invoke as | Scope |

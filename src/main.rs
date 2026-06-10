@@ -7,7 +7,7 @@ use std::time::Instant;
 
 const EMBEDDING_DIM: usize = 1024;
 const DEFAULT_EMBEDDING_URL: &str = "http://192.168.4.1:8080/v1/embeddings";
-const BATCH_SIZE: usize = 8;
+const BATCH_SIZE: usize = 32;
 
 #[derive(Parser)]
 #[command(name = "mannaminne", about = "Hybrid semantic + keyword search over the personal life-corpus (CC sessions, docs, Messenger, AI-chat, Simplenote). Invoke as `ccsearch` to scope to CC sources only.")]
@@ -458,6 +458,60 @@ fn cap_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Split text into non-overlapping ~`size`-char chunks (char-safe), capped at
+/// `max_chunks` (bounds the pathological mega-thread so the in-memory index
+/// stays fast).
+fn chunk_text(s: &str, size: usize, max_chunks: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && out.len() < max_chunks {
+        let end = (i + size).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
+}
+
+/// Emit one IndexEntry per ~750-char chunk of `full`. Single-chunk objects keep
+/// the bare `base_id`; multi-chunk objects get `base_id#<i>` + a "[i/n]" title
+/// suffix so a hit names its slice. Long Messenger threads / AI-chat
+/// conversations thus become individually-searchable slices rather than a
+/// first-800-chars-only embedding.
+fn push_chunks(
+    out: &mut Vec<IndexEntry>,
+    base_id: &str,
+    kind: EntryKind,
+    project: &str,
+    title: &str,
+    full: &str,
+    path: &str,
+    created: &str,
+) {
+    let chunks = chunk_text(full, 750, 60);
+    let total = chunks.len();
+    if total == 0 {
+        return;
+    }
+    for (i, ch) in chunks.into_iter().enumerate() {
+        let (id, t) = if total > 1 {
+            (format!("{base_id}#{i}"), format!("{title} [{}/{}]", i + 1, total))
+        } else {
+            (base_id.to_string(), title.to_string())
+        };
+        out.push(IndexEntry {
+            id,
+            kind: kind.clone(),
+            project: project.to_string(),
+            title: t,
+            text: ch,
+            path: path.to_string(),
+            created: created.to_string(),
+            embedding: vec![],
+        });
+    }
+}
+
 /// Facebook Messenger archive: one entry per thread.
 /// `~/Projects/messenger-archive/your_activity_across_facebook/messages/inbox/<id>/message_*.json`
 fn discover_messenger() -> Vec<IndexEntry> {
@@ -521,7 +575,7 @@ fn discover_messenger() -> Vec<IndexEntry> {
                         }
                     }
                     if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
-                        if body.chars().count() < 1600 {
+                        if body.chars().count() < 45000 {
                             let who = m
                                 .get("sender_name")
                                 .and_then(|s| s.as_str())
@@ -546,21 +600,23 @@ fn discover_messenger() -> Vec<IndexEntry> {
         } else {
             String::new()
         };
-        let text = cap_chars(&format!("{title}\n{body}"), 1600);
-        out.push(IndexEntry {
-            id: format!("msg:{thread_id}"),
-            kind: EntryKind::Messenger,
-            project: "messenger".to_string(),
-            title: if title.is_empty() {
-                cap_chars(&body, 60)
-            } else {
-                title
-            },
-            text,
-            path: dir.to_string_lossy().to_string(),
-            created,
-            embedding: vec![],
-        });
+        let disp_title = if title.is_empty() {
+            cap_chars(&body, 60)
+        } else {
+            title.clone()
+        };
+        let full = format!("{title}\n{body}");
+        let path = dir.to_string_lossy().to_string();
+        push_chunks(
+            &mut out,
+            &format!("msg:{thread_id}"),
+            EntryKind::Messenger,
+            "messenger",
+            &disp_title,
+            &full,
+            &path,
+            &created,
+        );
     }
     out
 }
@@ -642,17 +698,19 @@ fn discover_aichat() -> Vec<IndexEntry> {
         if title.is_empty() && body.trim().is_empty() {
             continue;
         }
-        let text = cap_chars(&format!("{title}\n{body}"), 1600);
-        out.push(IndexEntry {
-            id: format!("aichat:cg:{id_part}"),
-            kind: EntryKind::AiChat,
-            project: "chatgpt".to_string(),
-            title: if title.is_empty() { cap_chars(&body, 60) } else { title },
-            text,
-            path: f.to_string_lossy().to_string(),
-            created: String::new(),
-            embedding: vec![],
-        });
+        let disp_title = if title.is_empty() { cap_chars(&body, 60) } else { title.clone() };
+        let full = format!("{title}\n{body}");
+        let path = f.to_string_lossy().to_string();
+        push_chunks(
+            &mut out,
+            &format!("aichat:cg:{id_part}"),
+            EntryKind::AiChat,
+            "chatgpt",
+            &disp_title,
+            &full,
+            &path,
+            "",
+        );
     }
 
     // Claude: */conversations/*.json with `name` + `chat_messages[].text`.
@@ -698,17 +756,19 @@ fn discover_aichat() -> Vec<IndexEntry> {
         if name.is_empty() && body.trim().is_empty() {
             continue;
         }
-        let text = cap_chars(&format!("{name}\n{body}"), 1600);
-        out.push(IndexEntry {
-            id: format!("aichat:cl:{uuid}"),
-            kind: EntryKind::AiChat,
-            project: "claude".to_string(),
-            title: if name.is_empty() { cap_chars(&body, 60) } else { name },
-            text,
-            path: f.to_string_lossy().to_string(),
-            created,
-            embedding: vec![],
-        });
+        let disp_title = if name.is_empty() { cap_chars(&body, 60) } else { name.clone() };
+        let full = format!("{name}\n{body}");
+        let path = f.to_string_lossy().to_string();
+        push_chunks(
+            &mut out,
+            &format!("aichat:cl:{uuid}"),
+            EntryKind::AiChat,
+            "claude",
+            &disp_title,
+            &full,
+            &path,
+            &created,
+        );
     }
 
     out
@@ -735,16 +795,17 @@ fn discover_notes() -> Vec<IndexEntry> {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        out.push(IndexEntry {
-            id: format!("note:{name}"),
-            kind: EntryKind::Note,
-            project: "simplenote".to_string(),
-            title: name,
-            text: cap_chars(&content, 1600),
-            path: f.to_string_lossy().to_string(),
-            created: String::new(),
-            embedding: vec![],
-        });
+        let path = f.to_string_lossy().to_string();
+        push_chunks(
+            &mut out,
+            &format!("note:{name}"),
+            EntryKind::Note,
+            "simplenote",
+            &name,
+            &content,
+            &path,
+            "",
+        );
     }
     out
 }

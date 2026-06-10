@@ -1,1 +1,3 @@
 target/
+py/.venv/
+py/__pycache__/
