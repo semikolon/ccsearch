@@ -231,17 +231,30 @@ def cmd_ingest(args):
     conn = load_conn()
     cur = conn.cursor()
     kinds = args.sources or list(ALL)
-    total = 0
+    seen, total = [], 0
     for kind in kinds:
         n, batch = 0, []
         for row in ALL[kind]():
-            batch.append(row)
+            seen.append(row[0]); batch.append(row)
             if len(batch) >= 500:
                 _upsert(cur, batch); conn.commit(); n += len(batch); batch = []
         if batch:
             _upsert(cur, batch); conn.commit(); n += len(batch)
         total += n
         print(f"  {kind}: {n} chunks upserted", flush=True)
+    # orphan cleanup: drop chunks of the processed kinds NOT produced this run
+    # (source object deleted, or shrank below a chunk_idx). Temp-table anti-join.
+    if seen:
+        cur.execute("CREATE TEMP TABLE _seen (id text)")
+        with cur.copy("COPY _seen (id) FROM STDIN") as cp:
+            for x in seen:
+                cp.write_row((x,))
+        cur.execute("CREATE INDEX ON _seen (id)")
+        cur.execute("DELETE FROM chunks WHERE source_kind = ANY(%s) "
+                    "AND NOT EXISTS (SELECT 1 FROM _seen s WHERE s.id = chunks.id)", (kinds,))
+        pruned = cur.rowcount
+        cur.execute("DROP TABLE _seen"); conn.commit()
+        print(f"  pruned {pruned} orphaned chunks", flush=True)
     print(f"ingest done: {total} chunks. (full-text search is live now.)", flush=True)
 
 def _upsert(cur, rows):
