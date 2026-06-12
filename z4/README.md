@@ -26,27 +26,24 @@ the ~830k-chunk backlog overnight. **Status (2026-06-12): LIVE, idle-only.**
   VRAM; a paused-but-loaded server would still hold ~4 GB and block higher-priority Z4 jobs).
 
 ## Mats-safety (the load-bearing constraint)
-The Z4 is Mats's daily Revit/AutoCAD workstation. Production runs **CarveOut=1 (carve-out)** as
-of 2026-06-12 (`run_embed.bat` passes `-CarveOut 1`): it embeds in the GPU-idle headroom
-**including Mats's active desk time** (the GPU sits mostly free even while he models — when he's
-just at the desk, only `dwm`/`explorer` are GPU-resident). Mats-protection is then:
-- **Cede** (~1.5s, kills the server) if: a **Revit OR AutoCAD** GPU-memory jump > 600 MB (he
-  started heavy GPU work), OR `E:\z4-coord\gpu-preempt.flag` appears (a higher-priority Z4 job —
-  OCR/synthesis — raises this shared marker; see the council doc). The CAD baseline is re-tracked
-  whenever the embedder isn't running, so a stale baseline can't permanent-cede.
-- **Validated 2026-06-12:** a flag-drop killed the server + freed VRAM (6.7→2.8 GB); separately,
-  the idle-only pre-flight correctly refused to launch while he was active.
-- **Residual:** a Revit op that spikes GPU *utilization* without grabbing >600 MB could briefly
-  stutter his viewport (seconds, no crash — the model is ~4 GB so a VRAM-exhaustion lock-up can't
-  recur). Reassurance: a GPU at 100% does NOT lock up the machine (CPU/RAM/typing/UI stay fine);
-  only GPU-accelerated apps feel it.
-- **Idle-only fallback** (`-CarveOut 0`): launches ONLY after console idle ≥ 20 min and cedes if
-  he returns (idle < 90s) — so it never runs while he's at the desk. Revert to this if the
-  carve-out ever disturbs him.
-- Reassurance worth knowing: a GPU at 100% does NOT lock up the machine (CPU/RAM/typing/UI
-  fine); only GPU-accelerated apps (Revit/AutoCAD viewport) feel sluggish — which is exactly
-  what idle-only avoids. Also empirically, "console active" ≠ "GPU-loaded CAD": when Mats is
-  just at his desk the GPU is genuinely free (only `dwm`/`explorer` resident).
+The Z4 is Mats's daily workstation — and he often works **remotely via Parsec** (which uses the
+GPU's NVENC to stream his session). Production runs **CarveOut=0 (idle-only)** (`run_embed.bat`
+passes `-CarveOut 0`):
+- **Pre-flight** — launches ONLY after the console is idle ≥ 20 min (`quser` session idle, which
+  correctly shows Mats present for BOTH local and Parsec sessions; NOT `GetLastInputInfo`).
+- **Cede** (~1.5s, kills the server) if console idle < 90s (Mats returned) OR
+  `E:\z4-coord\gpu-preempt.flag` appears (a higher-priority Z4 job preempts; see the council doc).
+- Net: **never runs while Mats is at his machine (local or Parsec).** A 45-min health loop verifies this.
+
+**Why NOT the carve-out** (running during his active-but-GPU-idle desk time): tried for ~1h on
+2026-06-12, proved unsafe. (a) Mats works via Parsec, which uses the GPU — so "active at the desk"
+often means "GPU-busy," and the embedder hit **88% util competing with his stream** before the
+health loop caught it. (b) **🚨 Per-process GPU memory reads `[N/A]` on this A4000**
+(`nvidia-smi --query-compute-apps=...,used_memory` → `[N/A]`), so the Revit/AutoCAD memory-jump
+cede is BLIND and never fires — it can't detect his CAD/Parsec GPU use. (The same flaw affects
+brf-auto's `gpu_guard_local.ps1` — flagged in the council doc.) **Console-idle (`quser`) is the only
+reliable Mats-present signal**, hence idle-only. Reassurance: a GPU at 100% does not lock up the
+machine (CPU/RAM/UI stay fine) — but Parsec IS a GPU app, so his remote session would feel it.
 
 ## Run / check / stop
 - **Standing setup** (running as of 2026-06-12): the `z4-embed-server` guard task + the
@@ -61,8 +58,9 @@ just at the desk, only `dwm`/`explorer` are GPU-resident). Mats-protection is th
   `ssh z4 'powershell -File E:\llama-embed\kill_embed.ps1'` (the `/end` force-kills the guard
   so its cleanup is skipped → `kill_embed` prevents an orphaned server).
 - **Deploy script changes** — `scp z4/*.ps1 z4/*.bat z4:E:/llama-embed/` then restart the task.
-- **Revert to idle-only** (if the carve-out ever disturbs Mats): set `run_embed.bat` back to
-  `-CarveOut 0` + restart the task (then it launches only after console idle ≥ 20 min).
+- **Carve-out (NOT recommended)** — `-CarveOut 1` runs during Mats-active GPU-idle time, but his
+  Parsec use + the `[N/A]` per-process-GPU-memory detection make it unsafe (see Mats-safety).
+  Idle-only is production.
 
 ## Known caveats (fix when touched)
 - **Orphan on force-kill** — `schtasks /end` skips the guard's `finally`, orphaning the server

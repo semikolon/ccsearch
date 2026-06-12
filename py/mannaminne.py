@@ -606,12 +606,15 @@ def cmd_embed(args):
                     except Exception:
                         pass
                 return out
-        wrote = 0
+        results = []                                  # 6 workers => leaves GPU headroom for Mats
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
             for res in ex.map(work, pairs):
-                for cid, emb in res:
-                    cur.execute("UPDATE chunks SET embedding=%s::vector WHERE id=%s", (_vec(emb), cid))
-                    wrote += 1
+                results.extend(res)
+        wrote = len(results)
+        if results:                                   # bulk write: psycopg3 pipelines executemany,
+            cur.executemany(                          # ~one round-trip vs 2000 (the real bottleneck)
+                "UPDATE chunks SET embedding=%s::vector WHERE id=%s",
+                [(_vec(emb), cid) for cid, emb in results])
         conn.commit()
         done += wrote
         print(f"  embedded ~{done}/{pending} (+{wrote})", flush=True)
