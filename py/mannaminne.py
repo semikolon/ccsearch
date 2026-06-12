@@ -20,12 +20,15 @@ Design: ~/dotfiles/docs/personal_archives_semantic_search_2026_06_10.md § v2.
 """
 from __future__ import annotations
 import os, sys, json, glob, hashlib, argparse, concurrent.futures, time, urllib.request
+import re, email, html as _htmllib
+from email import policy as _emailpolicy
+import email.utils as _emailutils
 from pathlib import Path
 
 HOME = os.path.expanduser("~")
 EMBED_URL = os.environ.get("MANNAMINNE_EMBED_URL", "http://192.168.4.1:8080/v1/embeddings")
-EMBED_MODEL = "qwen3-embedding-4b"
-EMBED_DIM = 1024
+EMBED_MODEL = os.environ.get("MANNAMINNE_EMBED_MODEL", "qwen3-embedding-4b")
+EMBED_DIM = int(os.environ.get("MANNAMINNE_EMBED_DIM", "1024"))  # 8B native=4096; MRL-truncatable to 1024
 CHUNK_SIZE = 750          # chars (~250 tokens, safely under the embedder's 512 budget)
 CHUNK_OVERLAP = 80        # so a needle on a boundary isn't orphaned
 MAX_CHUNKS = 400          # per source object (bounds pathological mega-objects)
@@ -76,9 +79,11 @@ def h(s: str) -> str:
 # Each row: (id, source_kind, source_id, chunk_idx, project, title, text, created, content_hash)
 
 def _rows(source_kind, source_id, project, title, full, created):
+    title = (title or "").replace("\x00", "")          # Postgres text rejects NUL (0x00)
     for idx, ch in chunk(full):
-        cid = f"{source_id}#{idx}"
-        yield (cid, source_kind, source_id, idx, project, title, ch, created, h(ch))
+        ch = ch.replace("\x00", "")
+        yield (f"{source_id}#{idx}", source_kind, source_id, idx, project,
+               title, ch, created, h(ch))
 
 def discover_messenger():
     base = Path(HOME) / "Projects/messenger-archive/your_activity_across_facebook/messages/inbox"
@@ -222,8 +227,112 @@ def discover_sessions():
         title = (parts[0][:80] if parts else sid)
         yield from _rows("session", f"session:{sid}", proj, title, full, created)
 
+# --- email (mbox: Gmail Takeout + curated subsets) --------------------------
+# Streaming parser — never loads the whole file (the Gmail Takeout is 4.7 GB).
+# Dedups by Message-ID across all mboxes; reports unique-new per file.
+
+MBOX_SOURCES = [
+    ("takeout2014",
+     "/Volumes/FERMI/MacMini-archives additions/demeter_2017_drive/"
+     "emails_documents_2014/All mail Including Spam and Trash-2.mbox"),
+    ("deliberus",
+     os.path.join(HOME, "Projects/deliberus/archive/demeter_2017_dropbox/"
+                        "excavated_emails/deliberus_relevant.mbox")),
+]
+
+def _strip_html(s: str) -> str:
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = _htmllib.unescape(s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n\n", s)
+    return s.strip()
+
+_ENVELOPE = re.compile(rb"^From \S+ (Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z][a-z] +\d")
+
+def _iter_mbox(path):
+    """Yield raw message bytes one at a time. Splits on a `From <id> <Weekday>
+    <Mon> <DD> …` envelope line (Gmail Takeout / Apple Mail format) — these are
+    NOT reliably blank-preceded, so match the envelope shape directly. The strict
+    regex avoids false splits on body lines that merely start with 'From '.
+    Memory-safe for multi-GB mboxes (streams one message at a time)."""
+    buf = bytearray()
+    with open(path, "rb") as fh:
+        for line in fh:
+            if _ENVELOPE.match(line):
+                if buf:
+                    yield bytes(buf)
+                    buf = bytearray()
+            buf += line
+    if buf:
+        yield bytes(buf)
+
+def _email_body(msg) -> str:
+    try:
+        part = msg.get_body(preferencelist=("plain", "html"))
+        if part is not None:
+            content = part.get_content()
+            return _strip_html(content) if part.get_content_subtype() == "html" else content
+    except Exception:
+        pass
+    out = []                                   # fallback: walk parts
+    try:
+        for p in msg.walk():
+            ct = p.get_content_type()
+            try:
+                if ct == "text/plain":
+                    out.append(p.get_content())
+                elif ct == "text/html":
+                    out.append(_strip_html(p.get_content()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return "\n".join(out)
+
+def discover_email():
+    seen = set()
+    for label, path in MBOX_SOURCES:
+        if not os.path.exists(path):
+            print(f"  (email/{label}: missing at {path})", flush=True)
+            continue
+        nmsg = nuniq = nskip = 0
+        for raw in _iter_mbox(path):
+            nmsg += 1
+            if raw.startswith(b"From "):           # strip mbox envelope separator
+                nl = raw.find(b"\n")
+                raw = raw[nl + 1:] if nl != -1 else raw
+            try:
+                msg = email.message_from_bytes(raw, policy=_emailpolicy.default)
+            except Exception:
+                nskip += 1; continue
+            mid = (str(msg.get("Message-ID") or msg.get("Message-Id") or "")).strip().strip("<>")
+            subj = str(msg.get("Subject") or "").strip()
+            frm = str(msg.get("From") or "").strip()
+            to = str(msg.get("To") or "").strip()
+            datehdr = str(msg.get("Date") or "").strip()
+            body = _email_body(msg) or ""
+            if not subj and not body:
+                nskip += 1; continue
+            key = mid or h(f"{datehdr}|{frm}|{subj}|{len(body)}")
+            if key in seen:
+                continue
+            seen.add(key); nuniq += 1
+            created = ""
+            try:
+                dt = _emailutils.parsedate_to_datetime(datehdr)
+                if dt:
+                    created = dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            title = subj or (frm[:60] if frm else "(no subject)")
+            full = f"{subj}\nFrom: {frm}\nTo: {to}\nDate: {datehdr}\n\n{body}"
+            yield from _rows("email", f"email:{h(key)}", "gmail", title, full, created)
+        print(f"  email/{label}: {nmsg} msgs → {nuniq} unique-new, {nskip} skipped", flush=True)
+
 ALL = {"messenger": discover_messenger, "aichat": discover_aichat,
-       "note": discover_notes, "doc": discover_docs, "session": discover_sessions}
+       "note": discover_notes, "doc": discover_docs, "session": discover_sessions,
+       "email": discover_email}
 
 # --- ingest -----------------------------------------------------------------
 
@@ -376,7 +485,7 @@ def cmd_search(args):
     if not ranked:
         print("No results."); return
     tag = {"session": "\033[36m[session]", "doc": "\033[33m[doc]", "messenger": "\033[35m[msgr]",
-           "aichat": "\033[34m[aichat]", "note": "\033[32m[note]"}
+           "aichat": "\033[34m[aichat]", "note": "\033[32m[note]", "email": "\033[90m[email]"}
     for i, x in enumerate(ranked, 1):
         r = x["r"]
         kw = " \033[32m[kw]\033[0m" if x["kw"] else ""
@@ -397,7 +506,7 @@ def cmd_stats(args):
 
 def _scope(args):
     flags = []
-    for k in ("session", "doc", "messenger", "aichat", "note"):
+    for k in ("session", "doc", "messenger", "aichat", "note", "email"):
         if getattr(args, k, False):
             flags.append(k)
     if flags:
@@ -416,6 +525,7 @@ def _add_search_args(sp):
     sp.add_argument("-m", "--messenger", action="store_true")
     sp.add_argument("-a", "--aichat", action="store_true")
     sp.add_argument("--note", action="store_true")
+    sp.add_argument("-e", "--email", action="store_true")
 
 def main():
     argv = sys.argv[1:]
