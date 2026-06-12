@@ -428,9 +428,99 @@ def discover_fyr():
             n += 1
     print(f"  fyr: {n} tasks", flush=True)
 
+# --- Screenshots + Photos (Apple Vision OCR via ocrmac, + osxphotos labels) ---
+# Two image troves, both indexed as source_kind 'screenshot':
+#  (1) Mac screenshots archived on FERMI (~5k PNGs)
+#  (2) iPhone screenshots + label-rich photos in the Photos library (originals
+#      local on FERMI). osxphotos gives file paths + Apple's scene/object labels;
+#      ocrmac (Apple Vision) extracts the text (Apple's own OCR isn't exposed for
+#      this non-active library). OCR is cached to disk so re-runs skip the work.
+#  OCR only screenshots (text-bearing); index labels for ALL photos.
+
+_OCR_CACHE = Path(HOME) / ".cache/mannaminne/ocr_cache.json"
+_FERMI_SS = "/Volumes/FERMI/MacMini-archives additions/Screenshots"
+_FERMI_PHOTOLIB = "/Volumes/FERMI/Photos Library.photoslibrary"
+
+def _ocr_text(path, cache):
+    if not path:
+        return ""
+    if path in cache:
+        return cache[path]
+    txt = ""
+    try:
+        from ocrmac import ocrmac
+        res = ocrmac.OCR(path, framework="vision").recognize()
+        txt = " ".join(t for t, _c, _b in res).strip()
+    except Exception:
+        txt = ""
+    cache[path] = txt
+    return txt
+
+def discover_screenshots():
+    import json as _json
+    cache = {}
+    if _OCR_CACHE.exists():
+        try:
+            cache = _json.loads(_OCR_CACHE.read_text())
+        except Exception:
+            cache = {}
+    _OCR_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    limit = int(os.environ.get("MANNAMINNE_SS_LIMIT", "0"))   # >0 = smoke-test cap
+    n = 0
+
+    def _flush():
+        try:
+            _OCR_CACHE.write_text(_json.dumps(cache))
+        except Exception:
+            pass
+
+    # (1) Mac screenshots on FERMI
+    for f in sorted(glob.glob(os.path.join(_FERMI_SS, "*.png")) +
+                    glob.glob(os.path.join(_FERMI_SS, "*.jpg"))):
+        if limit and n >= limit:
+            break
+        n += 1
+        txt = _ocr_text(f, cache)
+        if n % 200 == 0:
+            _flush()
+        if not txt:
+            continue
+        name = os.path.basename(f)
+        created = time.strftime("%Y-%m-%d", time.gmtime(os.path.getmtime(f)))
+        yield from _rows("screenshot", f"ss:mac:{name}", "mac-screenshot", name,
+                         f"{name}\n{txt}", created)
+
+    # (2) iPhone / Photos library — OCR screenshots, label everything
+    if not (limit and n >= limit):
+        try:
+            import osxphotos
+            db = osxphotos.PhotosDB(_FERMI_PHOTOLIB)
+        except Exception as e:
+            print(f"  (photos: osxphotos unavailable: {type(e).__name__})", flush=True)
+            db = None
+        if db:
+            for p in db.photos():
+                if limit and n >= limit:
+                    break
+                n += 1
+                labels = ", ".join((p.labels or [])[:10])
+                txt = _ocr_text(p.path, cache) if (p.path and p.screenshot) else ""
+                if not txt and not labels:
+                    continue
+                lbl = "iphone-screenshot" if p.screenshot else "photo"
+                head = p.original_filename or (p.uuid[:10] if p.uuid else "photo")
+                created = p.date.strftime("%Y-%m-%d") if p.date else ""
+                body = f"{head} [{labels}]" + (f"\n{txt}" if txt else "")
+                yield from _rows("screenshot", f"photo:{p.uuid}", lbl, head, body, created)
+                if n % 200 == 0:
+                    _flush()
+    _flush()
+    print(f"  screenshots/photos: {n} images processed (OCR cached at {_OCR_CACHE})", flush=True)
+
 ALL = {"messenger": discover_messenger, "aichat": discover_aichat,
        "note": discover_notes, "doc": discover_docs, "session": discover_sessions,
-       "email": discover_email, "things3": discover_things3, "fyr": discover_fyr}
+       "email": discover_email, "things3": discover_things3, "fyr": discover_fyr,
+       "screenshot": discover_screenshots}
 
 # --- ingest -----------------------------------------------------------------
 
@@ -584,7 +674,8 @@ def cmd_search(args):
         print("No results."); return
     tag = {"session": "\033[36m[session]", "doc": "\033[33m[doc]", "messenger": "\033[35m[msgr]",
            "aichat": "\033[34m[aichat]", "note": "\033[32m[note]", "email": "\033[90m[email]",
-           "things3": "\033[93m[things3]", "fyr": "\033[91m[fyr]"}
+           "things3": "\033[93m[things3]", "fyr": "\033[91m[fyr]",
+           "screenshot": "\033[96m[shot]"}
     for i, x in enumerate(ranked, 1):
         r = x["r"]
         kw = " \033[32m[kw]\033[0m" if x["kw"] else ""
@@ -605,7 +696,7 @@ def cmd_stats(args):
 
 def _scope(args):
     flags = []
-    for k in ("session", "doc", "messenger", "aichat", "note", "email", "things3", "fyr"):
+    for k in ("session", "doc", "messenger", "aichat", "note", "email", "things3", "fyr", "screenshot"):
         if getattr(args, k, False):
             flags.append(k)
     if flags:
@@ -627,6 +718,7 @@ def _add_search_args(sp):
     sp.add_argument("-e", "--email", action="store_true")
     sp.add_argument("-t", "--things3", action="store_true")
     sp.add_argument("-f", "--fyr", action="store_true")
+    sp.add_argument("-p", "--photos", dest="screenshot", action="store_true")
 
 def main():
     argv = sys.argv[1:]
