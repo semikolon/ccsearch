@@ -2,7 +2,7 @@
 
 Semantic-embedding backend for mannaminne (and the same-space fallback story for Graphiti).
 Runs Qwen3-Embedding-4B on the Z4's A4000 instead of Darwin's contended GTX-1650, clearing
-the ~830k-chunk backlog overnight. **Status (2026-06-12): LIVE, idle-only.**
+the backlog overnight. **Status (2026-06-12 evening): LIVE, always-on with CAD-presence cede; ~122k/937k done, ~25/sec.**
 
 ## Architecture
 - **Model** — `Qwen3-Embedding-4B-Q4_K_M.gguf`, **byte-identical to Darwin's** (sha256
@@ -26,24 +26,28 @@ the ~830k-chunk backlog overnight. **Status (2026-06-12): LIVE, idle-only.**
   VRAM; a paused-but-loaded server would still hold ~4 GB and block higher-priority Z4 jobs).
 
 ## Mats-safety (the load-bearing constraint)
-The Z4 is Mats's daily workstation — and he often works **remotely via Parsec** (which uses the
-GPU's NVENC to stream his session). Production runs **CarveOut=0 (idle-only)** (`run_embed.bat`
-passes `-CarveOut 0`):
-- **Pre-flight** — launches ONLY after the console is idle ≥ 20 min (`quser` session idle, which
-  correctly shows Mats present for BOTH local and Parsec sessions; NOT `GetLastInputInfo`).
-- **Cede** (~1.5s, kills the server) if console idle < 90s (Mats returned) OR
-  `E:\z4-coord\gpu-preempt.flag` appears (a higher-priority Z4 job preempts; see the council doc).
-- Net: **never runs while Mats is at his machine (local or Parsec).** A 45-min health loop verifies this.
+The Z4 is Mats's daily workstation (he works locally, and occasionally remotely via Parsec).
+Production runs **always-on (CarveOut=1)** with a **CAD-presence cede** (`run_embed.bat` passes
+`-CarveOut 1`):
+- **No idle gate** — both auto-idle signals are broken on this box (see below), so the guard runs
+  continuously and protects Mats by ceding, not by gating.
+- **Cede** (~1.5s, kills the server) when: **Revit/AutoCAD is process-present** in
+  `nvidia-smi --query-compute-apps` (Mats doing local CAD — works despite `[N/A]` memory), OR
+  `E:\z4-coord\gpu-preempt.flag` appears (a higher-priority Z4 job preempts).
+- **Active-Parsec** (rare) is NOT auto-detected (`parsecd.exe` is GPU-present even when nobody's
+  connected = false positive). Fredrik flags it manually; the 45-min health loop also watches.
+- Reassurance: a GPU at 100% does not lock up the machine (CPU/RAM/UI stay fine); only GPU apps
+  (CAD viewport, or an active Parsec stream) feel it — and CAD triggers the cede.
 
-**Why NOT the carve-out** (running during his active-but-GPU-idle desk time): tried for ~1h on
-2026-06-12, proved unsafe. (a) Mats works via Parsec, which uses the GPU — so "active at the desk"
-often means "GPU-busy," and the embedder hit **88% util competing with his stream** before the
-health loop caught it. (b) **🚨 Per-process GPU memory reads `[N/A]` on this A4000**
-(`nvidia-smi --query-compute-apps=...,used_memory` → `[N/A]`), so the Revit/AutoCAD memory-jump
-cede is BLIND and never fires — it can't detect his CAD/Parsec GPU use. (The same flaw affects
-brf-auto's `gpu_guard_local.ps1` — flagged in the council doc.) **Console-idle (`quser`) is the only
-reliable Mats-present signal**, hence idle-only. Reassurance: a GPU at 100% does not lock up the
-machine (CPU/RAM/UI stay fine) — but Parsec IS a GPU app, so his remote session would feel it.
+**🚨 Why no idle gate — both auto-signals are broken on this A4000 (2026-06-12):**
+- **Per-process GPU memory reads `[N/A]`** (`nvidia-smi --query-compute-apps=...,used_memory` →
+  `[N/A]`), so any memory-jump cede is BLIND. (Same flaw hits brf-auto's `gpu_guard_local.ps1` —
+  flagged in the council doc.)
+- **`quser` console-idle is unreliable** — it reads "active" for hours after Mats physically
+  leaves, so an idle-≥20-min gate would essentially never fire (backlog would stall). (This also
+  means brf-auto's `LAUNCH_IDLE_MIN` OCR gate may never trigger here — flagged for them.)
+- Therefore **process-presence** (is Revit/AutoCAD running?) is the only working "Mats doing GPU
+  work" signal, and the embedder runs always-on + cedes on it.
 
 ## Run / check / stop
 - **Standing setup** (running as of 2026-06-12): the `z4-embed-server` guard task + the

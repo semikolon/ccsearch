@@ -35,15 +35,17 @@ $log = "E:\llama-embed\embed_guard.log"
 function Now(){ [DateTime]::Now.ToString('o') }
 function Log($m){ "$(Now) $m" | Add-Content $log }
 function IdleSec(){ try { [int](& $qs) } catch { 0 } }
-function RevitMB(){
-  # GPU memory held by Mats's CAD apps (Revit OR AutoCAD). A jump => he's doing heavy
-  # GPU work => cede. Matches both since he uses either (Fredrik, 2026-06-12).
+function CadPresent(){
+  # Is Mats doing local CAD work? Detect by PROCESS PRESENCE (Revit/AutoCAD running), since
+  # per-process GPU memory reads [N/A] on this A4000 (memory-jump detection is impossible) and
+  # quser console-idle is unreliable here (shows "active" for hours after he leaves).
+  # NOTE: Parsec-background is deliberately NOT included — parsecd is GPU-present even when Mats
+  # isn't connected; active-Parsec disruption is handled by the operator + the 45-min health loop.
   try {
-    $rows = nvidia-smi --query-compute-apps=process_name,used_memory --format=csv,noheader,nounits 2>$null
-    $mb = 0
-    foreach($r in $rows){ if($r -match 'Revit|acad|AutoCAD'){ $n=($r -split ',')[-1].Trim(); if($n -match '^\d+$'){ $mb += [int]$n } } }
-    $mb
-  } catch { 0 }
+    $rows = nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>$null
+    foreach($r in $rows){ if($r -match 'Revit|acad'){ return $true } }
+    $false
+  } catch { $false }
 }
 function FlagFresh(){
   if(-not (Test-Path $Flag)){ return $false }
@@ -72,18 +74,14 @@ function StopServer($why){
   if($DryRun){ Log "DRYRUN would-kill"; return }
   $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
 }
-$baseRevit = RevitMB
-Log "guard start (carveout=$CarveOut, revitBase=${baseRevit}MB, dryrun=$DryRun)"
+Log "guard start (carveout=$CarveOut, dryrun=$DryRun)"
 $end = (Get-Date).AddMinutes($MaxMin)
 try {
   while((Get-Date) -lt $end){
     $idle = IdleSec
-    $revit = RevitMB
-    $running = [bool](ServerProc)
-    if(-not $running){ $baseRevit = $revit }   # track Mats's current Revit footprint while we hold no VRAM
     $cede = $null
-    if(FlagFresh){ $cede = "preempt-flag" }
-    elseif($running -and ($revit - $baseRevit) -gt $RevitJumpMB){ $cede = "revit+$($revit-$baseRevit)MB" }
+    if(FlagFresh){ $cede = "preempt-flag" }              # a higher-priority Z4 job wants the GPU
+    elseif((CadPresent)){ $cede = "cad-present" }         # Revit/AutoCAD running => Mats on local CAD
     elseif($CarveOut -eq 0 -and $idle -lt $CedeIdleSec){ $cede = "idle=${idle}s" }
     if($cede){ StopServer $cede; Start-Sleep -Seconds $PollSec; continue }
     $okToRun = ($CarveOut -eq 1) -or ($idle -ge ($LaunchIdleMin*60))
