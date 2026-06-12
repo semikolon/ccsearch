@@ -592,8 +592,8 @@ def cmd_embed(args):
         rows = cur.fetchall()
         if not rows:
             break
-        # batches of 2 (fits the embedder's 512-token budget), filled concurrently
-        pairs = [rows[i:i+2] for i in range(0, len(rows), 2)]
+        # batches of 8 (Z4 A4000 serves --parallel 8 slots; was 2 for Darwin's 512 budget)
+        pairs = [rows[i:i+8] for i in range(0, len(rows), 8)]
         def work(pair):
             try:
                 embs = _embed_batch([t[:CHUNK_SIZE] for _, t in pair])
@@ -606,13 +606,19 @@ def cmd_embed(args):
                     except Exception:
                         pass
                 return out
+        wrote = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
             for res in ex.map(work, pairs):
                 for cid, emb in res:
                     cur.execute("UPDATE chunks SET embedding=%s::vector WHERE id=%s", (_vec(emb), cid))
+                    wrote += 1
         conn.commit()
-        done += len(rows)
-        print(f"  embedded ~{done}/{pending}", flush=True)
+        done += wrote
+        print(f"  embedded ~{done}/{pending} (+{wrote})", flush=True)
+        if wrote == 0:
+            # server ceded/down (idle-window guard not yet serving, or mid-cede) — wait politely
+            print("  no progress (endpoint down/ceded?) — backing off 30s", flush=True)
+            time.sleep(30)
     # build HNSW once vectors exist (idempotent)
     cur.execute("SELECT count(*) FROM chunks WHERE embedding IS NOT NULL")
     if cur.fetchone()[0] > 0:
