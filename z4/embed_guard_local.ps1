@@ -63,8 +63,8 @@ function StartServer(){
   # slots + room for batched requests. Throughput-only — same GGUF/pooling => same-space.
   Start-Process -FilePath $Server -WindowStyle Hidden -ArgumentList @(
     "--model",$Model,"--embedding","--host","0.0.0.0","--port","$Port",
-    "-ngl","99","--parallel","8","--ctx-size","8192","--batch-size","2048","--ubatch-size","512",
-    "--threads","4","--threads-batch","4","--flash-attn","on","--mlock","--no-webui"
+    "-ngl","99","--parallel","4","--ctx-size","8192","--batch-size","4096","--ubatch-size","4096",
+    "--threads","4","--threads-batch","8","--flash-attn","on","--mlock","--no-webui"
   ) -RedirectStandardOutput "E:\llama-embed\llama-server.out" -RedirectStandardError "E:\llama-embed\llama-server.err"
 }
 function StopServer($why){

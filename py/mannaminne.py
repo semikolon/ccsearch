@@ -592,8 +592,8 @@ def cmd_embed(args):
         rows = cur.fetchall()
         if not rows:
             break
-        # batches of 8 (Z4 A4000 serves --parallel 8 slots; was 2 for Darwin's 512 budget)
-        pairs = [rows[i:i+8] for i in range(0, len(rows), 8)]
+        # batches of 16 (server --ubatch-size 4096 packs ~16 short inputs/dispatch; low concurrency)
+        pairs = [rows[i:i+16] for i in range(0, len(rows), 16)]
         def work(pair):
             try:
                 embs = _embed_batch([t[:CHUNK_SIZE] for _, t in pair])
@@ -606,8 +606,8 @@ def cmd_embed(args):
                     except Exception:
                         pass
                 return out
-        results = []                                  # 6 workers => leaves GPU headroom for Mats
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        results = []                                  # low concurrency (4) + big batch-of-16 per req
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             for res in ex.map(work, pairs):
                 results.extend(res)
         wrote = len(results)
