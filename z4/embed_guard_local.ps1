@@ -36,10 +36,12 @@ function Now(){ [DateTime]::Now.ToString('o') }
 function Log($m){ "$(Now) $m" | Add-Content $log }
 function IdleSec(){ try { [int](& $qs) } catch { 0 } }
 function RevitMB(){
+  # GPU memory held by Mats's CAD apps (Revit OR AutoCAD). A jump => he's doing heavy
+  # GPU work => cede. Matches both since he uses either (Fredrik, 2026-06-12).
   try {
     $rows = nvidia-smi --query-compute-apps=process_name,used_memory --format=csv,noheader,nounits 2>$null
     $mb = 0
-    foreach($r in $rows){ if($r -match 'Revit'){ $n=($r -split ',')[-1].Trim(); if($n -match '^\d+$'){ $mb += [int]$n } } }
+    foreach($r in $rows){ if($r -match 'Revit|acad|AutoCAD'){ $n=($r -split ',')[-1].Trim(); if($n -match '^\d+$'){ $mb += [int]$n } } }
     $mb
   } catch { 0 }
 }
