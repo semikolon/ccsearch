@@ -376,9 +376,61 @@ def discover_things3():
     con.close()
     print(f"  things3: {n} tasks", flush=True)
 
+# --- Fyr (the aggregator brain — FalkorDB task graph on Darwin, read-only) ----
+# Fyr aggregates personal + project todos as :Task nodes in a per-user FalkorDB
+# graph (fyr-<uuid>) on darwin.home:6380. One read captures both the TickTick
+# life-todos Fyr already mirrors AND the project TODO.md tasks. We index
+# name + summary (+ source/status as context). Tasks carry no embeddings in Fyr
+# (structural only); semantic comes from mannaminne's own embed once it resumes.
+
+def discover_fyr():
+    try:
+        from falkordb import FalkorDB
+    except ImportError:
+        print("  (fyr: falkordb client not installed — pip install falkordb)", flush=True)
+        return
+    host = os.environ.get("MANNAMINNE_FALKOR_HOST", "darwin.home")
+    try:
+        client = FalkorDB(host=host, port=6380, password="falkordb")
+        graphs = [g for g in client.list_graphs() if str(g).startswith("fyr-")]
+    except Exception as e:
+        print(f"  (fyr: FalkorDB unreachable at {host}:6380: {type(e).__name__})", flush=True)
+        return
+    if not graphs:
+        print("  (fyr: no fyr-* graph found)", flush=True)
+        return
+    n = 0
+    for gname in graphs:
+        g = client.select_graph(gname)
+        try:
+            res = g.query("MATCH (t:Task) RETURN t.uuid, t.name, t.summary, "
+                          "t.status, t.external_source, t.created_at")
+        except Exception:
+            continue
+        for rec in res.result_set:
+            uuid, name, summary, status, ext, created = (list(rec) + [None] * 6)[:6]
+            name = (name or "").strip()
+            summary = (summary or "").strip()
+            if not name and not summary:
+                continue
+            head = f"{name} [{ext or 'fyr'}/{status or '?'}]"
+            full = f"{head}\n{summary}" if summary else head
+            created_s = ""
+            if created:
+                try:
+                    v = float(created)
+                    if v > 1e11:                 # Fyr stores created_at in epoch MS
+                        v /= 1000.0
+                    created_s = time.strftime("%Y-%m-%d", time.gmtime(v))
+                except Exception:
+                    created_s = str(created)[:10]
+            yield from _rows("fyr", f"fyr:{uuid}", "fyr", name or "task", full, created_s)
+            n += 1
+    print(f"  fyr: {n} tasks", flush=True)
+
 ALL = {"messenger": discover_messenger, "aichat": discover_aichat,
        "note": discover_notes, "doc": discover_docs, "session": discover_sessions,
-       "email": discover_email, "things3": discover_things3}
+       "email": discover_email, "things3": discover_things3, "fyr": discover_fyr}
 
 # --- ingest -----------------------------------------------------------------
 
@@ -532,7 +584,7 @@ def cmd_search(args):
         print("No results."); return
     tag = {"session": "\033[36m[session]", "doc": "\033[33m[doc]", "messenger": "\033[35m[msgr]",
            "aichat": "\033[34m[aichat]", "note": "\033[32m[note]", "email": "\033[90m[email]",
-           "things3": "\033[93m[things3]"}
+           "things3": "\033[93m[things3]", "fyr": "\033[91m[fyr]"}
     for i, x in enumerate(ranked, 1):
         r = x["r"]
         kw = " \033[32m[kw]\033[0m" if x["kw"] else ""
@@ -553,7 +605,7 @@ def cmd_stats(args):
 
 def _scope(args):
     flags = []
-    for k in ("session", "doc", "messenger", "aichat", "note", "email", "things3"):
+    for k in ("session", "doc", "messenger", "aichat", "note", "email", "things3", "fyr"):
         if getattr(args, k, False):
             flags.append(k)
     if flags:
@@ -574,6 +626,7 @@ def _add_search_args(sp):
     sp.add_argument("--note", action="store_true")
     sp.add_argument("-e", "--email", action="store_true")
     sp.add_argument("-t", "--things3", action="store_true")
+    sp.add_argument("-f", "--fyr", action="store_true")
 
 def main():
     argv = sys.argv[1:]
