@@ -330,9 +330,55 @@ def discover_email():
             yield from _rows("email", f"email:{h(key)}", "gmail", title, full, created)
         print(f"  email/{label}: {nmsg} msgs → {nuniq} unique-new, {nskip} skipped", flush=True)
 
+# --- Things 3 (the 7k-task goldmine — local SQLite, read-only) ---------------
+# Things3 stores everything in TMTask (type 0=task, 1=project, 2=heading) under a
+# per-install Group Container. We index non-trashed TASKS (open + completed — the
+# completed ones are historical needles), with area/project title as context.
+# creationDate is a Unix epoch (verified: 2013–2025 range), not Core Data.
+
+def discover_things3():
+    import sqlite3
+    base = Path(HOME) / "Library/Group Containers/JLMPQHK86H.com.culturedcode.ThingsMac"
+    dbs = sorted(glob.glob(str(base / "ThingsData-*/Things Database.thingsdatabase/main.sqlite")))
+    if not dbs:
+        print("  (things3: no DB found)", flush=True)
+        return
+    db = dbs[-1]
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+        SELECT t.uuid AS uuid, t.title AS title, t.notes AS notes, t.status AS status,
+               t.creationDate AS created, a.title AS area_title, p.title AS project_title
+        FROM TMTask t
+        LEFT JOIN TMArea a ON t.area = a.uuid
+        LEFT JOIN TMTask p ON t.project = p.uuid
+        WHERE t.trashed = 0 AND t.type = 0
+    """)
+    n = 0
+    for r in cur.fetchall():
+        title = (r["title"] or "").strip()
+        notes = (r["notes"] or "").strip()
+        if not title and not notes:
+            continue
+        ctx = (r["project_title"] or r["area_title"] or "").strip()
+        status = "done" if r["status"] == 3 else "open"
+        created = ""
+        if r["created"]:
+            try:
+                created = time.strftime("%Y-%m-%d", time.gmtime(float(r["created"])))
+            except Exception:
+                pass
+        head = f"[{ctx}] {title} ({status})" if ctx else f"{title} ({status})"
+        full = f"{head}\n{notes}" if notes else head
+        yield from _rows("things3", f"things3:{r['uuid']}", "things3", title or ctx or "task", full, created)
+        n += 1
+    con.close()
+    print(f"  things3: {n} tasks", flush=True)
+
 ALL = {"messenger": discover_messenger, "aichat": discover_aichat,
        "note": discover_notes, "doc": discover_docs, "session": discover_sessions,
-       "email": discover_email}
+       "email": discover_email, "things3": discover_things3}
 
 # --- ingest -----------------------------------------------------------------
 
@@ -485,7 +531,8 @@ def cmd_search(args):
     if not ranked:
         print("No results."); return
     tag = {"session": "\033[36m[session]", "doc": "\033[33m[doc]", "messenger": "\033[35m[msgr]",
-           "aichat": "\033[34m[aichat]", "note": "\033[32m[note]", "email": "\033[90m[email]"}
+           "aichat": "\033[34m[aichat]", "note": "\033[32m[note]", "email": "\033[90m[email]",
+           "things3": "\033[93m[things3]"}
     for i, x in enumerate(ranked, 1):
         r = x["r"]
         kw = " \033[32m[kw]\033[0m" if x["kw"] else ""
@@ -506,7 +553,7 @@ def cmd_stats(args):
 
 def _scope(args):
     flags = []
-    for k in ("session", "doc", "messenger", "aichat", "note", "email"):
+    for k in ("session", "doc", "messenger", "aichat", "note", "email", "things3"):
         if getattr(args, k, False):
             flags.append(k)
     if flags:
@@ -526,6 +573,7 @@ def _add_search_args(sp):
     sp.add_argument("-a", "--aichat", action="store_true")
     sp.add_argument("--note", action="store_true")
     sp.add_argument("-e", "--email", action="store_true")
+    sp.add_argument("-t", "--things3", action="store_true")
 
 def main():
     argv = sys.argv[1:]
