@@ -9,21 +9,21 @@
 #
 # Cede triggers (kill llama-server, free VRAM):
 #   (a) E:\z4-coord\gpu-preempt.flag present & fresh  -> a higher-priority job wants the GPU
-#   (b) Revit GPU memory jumps > RevitJumpMB while we run -> Mats doing heavy GPU work
+#   (b) Revit/AutoCAD process present in nvidia-smi -> Mats doing local CAD work
 #   (c) [idle-window mode only, CarveOut=0] console idle < CedeIdleSec -> Mats active
 #
 # The model is small (~3-4 GB) so it fits the active-GPU-idle CARVE-OUT
 # (Fredrik both-YES, 2026-06-12): in CarveOut=1 it may run while Mats is active,
-# ceding only on the flag or a real Revit GPU spike. Revit baseline is re-tracked
-# whenever we are NOT running, so a permanent false-cede can't happen.
+# ceding on the flag or local CAD process presence. Parsec-background is not a cede
+# signal because parsecd.exe is GPU-present even when nobody is connected.
 param(
   [string]$Server     = "E:\llama-embed\llama-server.exe",
   [string]$Model      = "E:\llama-embed\Qwen3-Embedding-4B-Q4_K_M.gguf",
   [int]$Port          = 8081,
   [string]$Flag       = "E:\z4-coord\gpu-preempt.flag",
   [int]$FlagStaleMin  = 15,
-  [int]$RevitJumpMB   = 600,
-  [int]$CarveOut      = 1,      # 1 = may run while Mats active (cede on flag/Revit only); 0 = idle-window only
+  [int]$RevitJumpMB   = 600,    # legacy/unused; kept for CLI compatibility with old runbooks
+  [int]$CarveOut      = 1,      # 1 = may run while Mats active (cede on flag/CAD only); 0 = idle-window only
   [int]$LaunchIdleMin = 20,     # used when CarveOut=0
   [int]$CedeIdleSec   = 90,     # used when CarveOut=0
   [double]$PollSec    = 2.0,

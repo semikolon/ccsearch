@@ -2,7 +2,7 @@
 REM z4-embed-server scheduled-task action.
 REM Runs the embed lifecycle guard in the foreground (so the task stays "running"
 REM while the guard loops). The guard manages llama-server: start / cede-by-kill /
-REM restart, per E:\z4-coord\gpu-preempt.flag + Revit GPU pressure. Args pass through
+REM restart, per E:\z4-coord\gpu-preempt.flag + Revit/AutoCAD process presence. Args pass through
 REM (e.g. -CarveOut 0 for idle-window-only, -DryRun to validate the cede).
 REM ALWAYS-ON with CAD-presence cede (CarveOut 1, Fredrik 2026-06-12 evening). Both auto-idle
 REM signals are broken on this box: per-process GPU memory reads [N/A], and quser console-idle

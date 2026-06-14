@@ -1,8 +1,8 @@
 # Z4 embedder — mannaminne backlog on Mats's RTX A4000
 
 Semantic-embedding backend for mannaminne (and the same-space fallback story for Graphiti).
-Runs Qwen3-Embedding-4B on the Z4's A4000 instead of Darwin's contended GTX-1650, clearing
-the backlog overnight. **Status (2026-06-12 evening): LIVE, always-on with CAD-presence cede; ~122k/937k done, ~25/sec.**
+Runs Qwen3-Embedding-4B on the Z4's A4000 instead of Darwin's contended GTX-1650 for large
+batch backfills. **Status (2026-06-14): backlog complete — 934,764/934,764 chunks embedded, HNSW built, Z4 server/guard/client stopped.** Darwin remains the live query-embedding fallback/standing endpoint.
 
 ## Architecture
 - **Model** — `Qwen3-Embedding-4B-Q4_K_M.gguf`, **byte-identical to Darwin's** (sha256
@@ -50,28 +50,29 @@ Production runs **always-on (CarveOut=1)** with a **CAD-presence cede** (`run_em
   work" signal, and the embedder runs always-on + cedes on it.
 
 ## Run / check / stop
-- **Standing setup** (running as of 2026-06-12): the `z4-embed-server` guard task + the
-  caffeinated Mac client + the self-healing tunnel are all up; the backlog clears in the next
-  idle window.
+- **Future batch run**: start the `z4-embed-server` guard task, start the SSH tunnel supervisor,
+  then run the Mac client under `caffeinate` with
+  `MANNAMINNE_EMBED_URL=http://127.0.0.1:8081/v1/embeddings`. The 2026-06-13 backlog is
+  complete; this runbook is for future backfills/re-embeds.
 - **Check count** — `cd ~/Projects/mannaminne/py && .venv/bin/python` then `load_conn()` +
   `SELECT count(*), count(embedding) FROM chunks`. (Do NOT shell-source `db.env` for psql —
   the password mangles in the shell; use the tool's own `psycopg` connection.)
-- **Restart guard** — `ssh z4 'schtasks /run /tn z4-embed-server'` (idle-only; self-launches
-  the server in idle windows).
+- **Restart guard** — `ssh z4 'schtasks /run /tn z4-embed-server'` (starts the local guard; it
+  launches/stops the server per the current `embed_guard_local.ps1` policy).
 - **Stop cleanly** — `ssh z4 'schtasks /end /tn z4-embed-server'` **then**
   `ssh z4 'powershell -File E:\llama-embed\kill_embed.ps1'` (the `/end` force-kills the guard
   so its cleanup is skipped → `kill_embed` prevents an orphaned server).
 - **Deploy script changes** — `scp z4/*.ps1 z4/*.bat z4:E:/llama-embed/` then restart the task.
-- **Carve-out (NOT recommended)** — `-CarveOut 1` runs during Mats-active GPU-idle time, but his
-  Parsec use + the `[N/A]` per-process-GPU-memory detection make it unsafe (see Mats-safety).
-  Idle-only is production.
+- **Idle-window fallback** — `-CarveOut 0` is available, but is not production on this box:
+  `quser` stayed active for hours after Mats left, so idle-only mode can stall indefinitely.
 
 ## Known caveats (fix when touched)
 - **Orphan on force-kill** — `schtasks /end` skips the guard's `finally`, orphaning the server
   (holds VRAM, uncede-protected). Always `kill_embed.ps1` after; or add a graceful stop-marker;
   or a periodic orphan-sweep (cf. brf-auto `docker-logs-orphan-sweep`).
-- **AutoCAD not detected** — the Revit-mem cede greps only `Revit`; widen to `acad` before
-  trusting CarveOut=1 (moot for CarveOut=0, which cedes on console-activity, not GPU-app name).
+- **CAD detection is process-presence only** — `Revit|acad` in `nvidia-smi` is the working local
+  CAD signal. It deliberately ignores background `parsecd.exe`; active Parsec still needs
+  operator/health-loop attention.
 - **Throughput ~40/sec** — overnight-clearable. Tunable higher (more `--parallel`, bigger
   client batches) but not worth it for a one-time backlog.
 - **Permanently-failing rows** — a chunk that always errors stays NULL → the client backoff-
