@@ -692,7 +692,10 @@ def _embed_batch(texts):
         candidates = _embed_urls()
     for url in candidates:
         try:
-            timeout = EMBED_TIMEOUT if url == _EMBED_URL_CACHE or EXPLICIT_EMBED_URL else EMBED_PROBE_TIMEOUT
+            if EXPLICIT_EMBED_URL or url == _EMBED_URL_CACHE or url == DARWIN_EMBED_URL:
+                timeout = EMBED_TIMEOUT
+            else:
+                timeout = EMBED_PROBE_TIMEOUT
             out = _post_embed(url, texts, timeout)
             _EMBED_URL_CACHE = url
             return out
@@ -732,13 +735,22 @@ def cmd_embed(args):
     cur = conn.cursor()
     cur.execute("SELECT count(*) FROM chunks WHERE embedding IS NULL")
     pending = cur.fetchone()[0]
+    max_total = getattr(args, "limit", 0) if args else 0
     print(f"embedding: {pending} chunks pending", flush=True)
     done = 0
     while True:
-        cur.execute("SELECT id,text FROM chunks WHERE embedding IS NULL LIMIT %s", (EMBED_SELECT_LIMIT,))
+        select_limit = EMBED_SELECT_LIMIT
+        if max_total:
+            remaining = max_total - done
+            if remaining <= 0:
+                break
+            select_limit = min(select_limit, remaining)
+        cur.execute("SELECT id,text FROM chunks WHERE embedding IS NULL LIMIT %s", (select_limit,))
         rows = cur.fetchall()
+        conn.commit()  # close the read transaction before slow network embedding work
         if not rows:
             break
+        print(f"  selected {len(rows)} pending chunks for embedding", flush=True)
         pairs = [rows[i:i + EMBED_BATCH_SIZE] for i in range(0, len(rows), EMBED_BATCH_SIZE)]
         results = []
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=EMBED_WORKERS)
@@ -758,6 +770,8 @@ def cmd_embed(args):
         conn.commit()
         done += wrote
         print(f"  embedded ~{done}/{pending} (+{wrote})", flush=True)
+        if max_total and done >= max_total:
+            break
         if wrote == 0:
             # server ceded/down (idle-window guard not yet serving, or mid-cede) — wait politely
             print("  no progress (endpoint down/ceded?) — backing off 30s", flush=True)
@@ -765,7 +779,7 @@ def cmd_embed(args):
     # build HNSW once vectors exist (idempotent)
     cur.execute("SELECT count(*) FROM chunks WHERE embedding IS NOT NULL")
     if cur.fetchone()[0] > 0:
-        print("building HNSW index (cosine)...", flush=True)
+        print("ensuring HNSW index exists (cosine)...", flush=True)
         cur.execute("CREATE INDEX IF NOT EXISTS chunks_emb_hnsw ON chunks "
                     "USING hnsw (embedding vector_cosine_ops)")
         conn.commit()
@@ -1081,7 +1095,10 @@ def main():
         sp = argparse.ArgumentParser(); sp.add_argument("--sources", nargs="*")
         cmd_ingest(sp.parse_args(rest))
     elif cmd == "embed":
-        cmd_embed(None)
+        sp = argparse.ArgumentParser()
+        sp.add_argument("--limit", type=int, default=0,
+                        help="maximum pending chunks to embed in this run")
+        cmd_embed(sp.parse_args(rest))
     elif cmd == "stats":
         cmd_stats(None)
     elif cmd == "search":

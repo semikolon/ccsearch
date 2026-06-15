@@ -17,7 +17,7 @@
     ]
   },
   {
-    "query": "global CLAUDE.md mannaminne canonical personal life corpus search",
+    "query": "codex-safe-yolo unmanaged local bin launcher global Claude rules",
     "scope": "doc",
     "must_match": [
       {

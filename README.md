@@ -21,6 +21,7 @@ mannaminne search --keyword "exact phrase"
 mannaminne stats
 mannaminne ingest --sources doc
 mannaminne embed
+mannaminne embed --limit 500
 mannaminne eval --show-top
 ```
 
@@ -76,7 +77,8 @@ Docs use heading-aware markdown chunks. The global
 high-value operating context outside the usual docs roots.
 
 `embed` fills `NULL` embeddings. Failed batches are split recursively, so one bad
-batch does not poison the whole pending set.
+batch does not poison the whole pending set. Use `embed --limit N` for bounded
+smoke tests or staged backfills.
 
 ## Search Ranking
 

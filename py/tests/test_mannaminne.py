@@ -49,6 +49,7 @@ class EmbeddingTests(unittest.TestCase):
         self.old = (
             m._EMBED_URL_CACHE, m.EXPLICIT_EMBED_URL, m.Z4_EMBED_URL,
             m.DARWIN_EMBED_URL, m.EMBED_DIM, m.EMBED_PROBE_TIMEOUT,
+            m.EMBED_TIMEOUT,
         )
         m._EMBED_URL_CACHE = None
         m.EXPLICIT_EMBED_URL = None
@@ -56,11 +57,13 @@ class EmbeddingTests(unittest.TestCase):
         m.DARWIN_EMBED_URL = "http://darwin.local/v1/embeddings"
         m.EMBED_DIM = 3
         m.EMBED_PROBE_TIMEOUT = 0.5
+        m.EMBED_TIMEOUT = 12.0
 
     def tearDown(self):
         (
             m._EMBED_URL_CACHE, m.EXPLICIT_EMBED_URL, m.Z4_EMBED_URL,
             m.DARWIN_EMBED_URL, m.EMBED_DIM, m.EMBED_PROBE_TIMEOUT,
+            m.EMBED_TIMEOUT,
         ) = self.old
 
     def test_embed_batch_prefers_z4_when_available(self):
@@ -80,7 +83,7 @@ class EmbeddingTests(unittest.TestCase):
         calls = []
 
         def fake_urlopen(req, timeout):
-            calls.append(req.full_url)
+            calls.append((req.full_url, timeout))
             if req.full_url == "http://z4.local/v1/embeddings":
                 raise TimeoutError("z4 unavailable")
             return FakeResponse({"data": [{"embedding": [4, 5, 6, 7]}]})
@@ -88,7 +91,10 @@ class EmbeddingTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", fake_urlopen):
             self.assertEqual(m._embed_batch(["hello"]), [[4, 5, 6]])
 
-        self.assertEqual(calls, ["http://z4.local/v1/embeddings", "http://darwin.local/v1/embeddings"])
+        self.assertEqual(calls, [
+            ("http://z4.local/v1/embeddings", 0.5),
+            ("http://darwin.local/v1/embeddings", 12.0),
+        ])
         self.assertEqual(m._EMBED_URL_CACHE, "http://darwin.local/v1/embeddings")
 
     def test_embed_batch_retries_z4_after_darwin_cache(self):
