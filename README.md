@@ -1,93 +1,141 @@
 # mannaminne
 
-Hybrid semantic + keyword search over Fredrik's **personal life-corpus**:
-Claude Code sessions, project/infra docs, Facebook Messenger, AI-chat archives
-(ChatGPT + Claude), and Simplenote notes. *"i mannaminne"* = in living memory.
+Hybrid semantic + keyword search over Fredrik's personal life-corpus: Claude
+Code sessions, local docs, Facebook Messenger, AI-chat archives, Simplenote,
+email, Things3, Fyr tasks, screenshots, and photo labels/OCR.
 
-Built in Rust. Uses the local Darwin embedding server (Qwen3-Embedding-4B on the
-GTX 1650) for semantic search; plain substring matching for keyword search. Was
-`ccsearch` (CC-sessions-only) through 2026-06; renamed + extended 2026-06-10.
+`mannaminne` means "in living memory". The old Rust binary remains in the repo
+for history, but the active implementation is:
 
-> **🚩 v2 in progress (2026-06-10):** the in-memory binary index documented below
-> is being superseded by a **Postgres + pgvector store on Darwin** with full-corpus
-> coverage (no truncation), Postgres FTS for guaranteed any-exact-needle keyword
-> search, and pgvector for semantic — because the in-memory design can't hold the
-> fully-chunked corpus (100k–700k+ chunks). Architecture + rationale:
-> `~/dotfiles/docs/personal_archives_semantic_search_2026_06_10.md` § v2 pivot.
-> The Rust in-memory tool below remains the interim CC-only search until v2 lands.
-
-## Names / scope
-
-| Invoke as | Scope |
-|---|---|
-| `mannaminne` / `minne` | **all sources** |
-| `ccsearch` (alias) | **CC sources only** (sessions + docs) — preserves the original tool's behavior |
-
-Scope is resolved from the invocation basename (argv0). Explicit source flags
-override it. `minne` and `ccsearch` are symlinks to the `mannaminne` binary.
+- Python CLI: `py/mannaminne.py`
+- Store: dedicated Postgres + pgvector on Darwin
+- Keyword: Postgres FTS + trigram substring
+- Semantic: Qwen3-Embedding-4B vectors, HNSW index
 
 ## Usage
 
 ```bash
-mannaminne index                    # build/update the index (incremental, cached by id)
-mannaminne index --force            # full re-embed
-mannaminne "kausal inferens Kaus"   # search all sources
-mannaminne stats                    # per-source counts
-
-# scope flags (override the invocation default)
-mannaminne search -s "<q>"       # CC sessions only
-mannaminne search -d "<q>"       # docs only
-mannaminne search -m "<q>"       # Messenger only
-mannaminne search -a "<q>"       # AI-chat only (ChatGPT + Claude)
-mannaminne search --notes "<q>"  # Simplenote only
-mannaminne search -k "<q>"       # keyword-only (no embedding call)
-
-ccsearch "<q>"                   # = CC sources only (sessions + docs)
+mannaminne "kausal inferens Kaus"
+mannaminne search -d "Z4 embedder backlog HNSW"
+mannaminne search --keyword "exact phrase"
+mannaminne stats
+mannaminne ingest --sources doc
+mannaminne embed
+mannaminne eval --show-top
 ```
 
-## Sources indexed
+Aliases:
 
-| Kind | Source | Entry granularity |
-|---|---|---|
-| `session` | `~/.claude/projects/*/sessions-index.json` (+ raw JSONL) | one per CC session (summary + first prompt) |
-| `doc` | `~/Projects/*/docs/**/*.md`, `~/dotfiles/docs/**/*.md` | one per `.md` (first 800 chars) |
-| `messenger` | `~/Projects/messenger-archive/.../inbox/<id>/message_*.json` | one per thread (title + de-mojibaked content sample) |
-| `aichat` | `~/Projects/ai-chat-archives/{chatgpt_*,claude_*}/conversations/*.json` | one per conversation |
-| `note` | `~/Documents/Simplenote Support Notes/*.txt` | one per note |
+| Invoke as | Scope |
+|---|---|
+| `mannaminne` / `minne` | all sources |
+| `ccsearch` | legacy CC scope: sessions + docs |
 
-Each entry stores ~1600 chars of text (for substring) and embeds the first 800
-(the embedder's ~512-token window). FB Messenger JSON is double-encoded UTF-8;
-`fix_mojibake()` reverses it (latin1→utf8 reinterpret).
-
-## Index storage
-
-Binary JSON at `~/.local/share/ccsearch/index.bin` (dir name kept from the
-`ccsearch` era so the existing CC embeddings stay cached across the rename;
-internal detail only). Incremental: `index` re-embeds only new ids; `--force`
-re-embeds all.
-
-## Build / install
+Source flags override the invocation default:
 
 ```bash
-cd ~/Projects/mannaminne && cargo build --release
-cp target/release/mannaminne ~/.local/bin/
-ln -sf mannaminne ~/.local/bin/minne
-ln -sf mannaminne ~/.local/bin/ccsearch
+-s / --session
+-d / --doc
+-m / --messenger
+-a / --aichat
+--note
+-e / --email
+-t / --things3
+-f / --fyr
+-p / --photos
 ```
 
-Fleet install is automated by `dotfiles/scripts/darwin/install-extra-binaries.sh`
-(builds from this dir, creates the `minne` + `ccsearch` aliases). The GitHub
-remote is still named `ccsearch` (`semikolon/ccsearch`); the Cargo package +
-binary are `mannaminne`.
+## Embedding Endpoint Selection
 
-## Dependencies
+If `MANNAMINNE_EMBED_URL` is set, it is used exactly.
 
-`clap`, `serde`/`serde_json`, `ureq` (sync HTTP), `glob`. Runtime: the Darwin
-embedding server reachable at `192.168.4.1:8080` (configurable via
-`CCSEARCH_EMBEDDING_URL`).
+Otherwise runtime default order is:
 
-## Design
+1. Z4 tunnel: `MANNAMINNE_Z4_EMBED_URL`, default `http://127.0.0.1:8081/v1/embeddings`
+2. Darwin fallback: `MANNAMINNE_DARWIN_EMBED_URL`, default `http://192.168.4.1:8080/v1/embeddings`
 
-Architecture + the three archive sources + the fresh-FB-download question:
-`~/dotfiles/docs/personal_archives_semantic_search_2026_06_10.md`.
-Messenger archive itself: `~/Projects/messenger-archive/README.md`.
+Darwin-safe defaults are intentionally conservative:
+
+```bash
+MANNAMINNE_EMBED_BATCH_SIZE=4
+MANNAMINNE_EMBED_WORKERS=2
+MANNAMINNE_EMBED_SELECT_LIMIT=500
+MANNAMINNE_EMBED_TIMEOUT=45
+MANNAMINNE_EMBED_PROBE_TIMEOUT=5
+```
+
+For a Z4 batch run, override these upward after the Z4 server/tunnel is live.
+
+## Indexing
+
+`ingest` discovers source content, chunks it, and upserts rows. If text changes,
+the chunk's embedding is reset to `NULL` so `embed` can refill it.
+
+Docs use heading-aware markdown chunks. The global
+`~/.claude/CLAUDE.md` file is indexed as a special doc source because it contains
+high-value operating context outside the usual docs roots.
+
+`embed` fills `NULL` embeddings. Failed batches are split recursively, so one bad
+batch does not poison the whole pending set.
+
+## Search Ranking
+
+Search is hybrid:
+
+1. Keyword candidates from FTS/trigram.
+2. Semantic candidates from pgvector.
+3. Reciprocal-rank fusion combines the two lists, with a small exact-match boost.
+
+The query embedding uses a Qwen3 instruction prefix; stored document chunks stay
+plain text.
+
+## Eval
+
+Golden queries live in `eval/golden_queries.json`.
+
+```bash
+mannaminne eval
+mannaminne eval --keyword
+mannaminne eval -k 20 --json
+```
+
+The eval command reports recall@k and MRR against the live DB. It is meant as a
+small regression harness before changing chunking, fusion, model, or storage
+settings.
+
+## Tests
+
+Tests use Python's standard `unittest`, no pytest dependency:
+
+```bash
+cd ~/Projects/mannaminne/py
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Current tests cover:
+
+- char and markdown chunking
+- NUL stripping and chunk hashes
+- Z4-first endpoint preference with Darwin fallback
+- recursive embedding batch split
+- rank fusion
+- eval expectation matching
+
+## Setup
+
+Fresh provisioning:
+
+```bash
+cd ~/Projects/mannaminne
+./setup.sh
+```
+
+This creates the venv, wrappers in `~/.local/bin`, and the Darwin pgvector
+Postgres container/schema. DB credentials live only in
+`~/.config/mannaminne/db.env`.
+
+Design and operational notes:
+
+- `~/dotfiles/docs/personal_archives_semantic_search_2026_06_10.md`
+- `~/Projects/mannaminne/z4/README.md`
+- `~/dotfiles/docs/local_codebase_semantic_search_research_plan_2026_06_14.md`

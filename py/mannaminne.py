@@ -26,12 +26,44 @@ import email.utils as _emailutils
 from pathlib import Path
 
 HOME = os.path.expanduser("~")
-EMBED_URL = os.environ.get("MANNAMINNE_EMBED_URL", "http://192.168.4.1:8080/v1/embeddings")
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    try:
+        return max(min_value, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+def _env_float(name: str, default: float, min_value: float = 0.1) -> float:
+    try:
+        return max(min_value, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+EXPLICIT_EMBED_URL = os.environ.get("MANNAMINNE_EMBED_URL")
+Z4_EMBED_URL = os.environ.get("MANNAMINNE_Z4_EMBED_URL", "http://127.0.0.1:8081/v1/embeddings")
+DARWIN_EMBED_URL = os.environ.get("MANNAMINNE_DARWIN_EMBED_URL", "http://192.168.4.1:8080/v1/embeddings")
+EMBED_URL = EXPLICIT_EMBED_URL or Z4_EMBED_URL
 EMBED_MODEL = os.environ.get("MANNAMINNE_EMBED_MODEL", "qwen3-embedding-4b")
-EMBED_DIM = int(os.environ.get("MANNAMINNE_EMBED_DIM", "1024"))  # 8B native=4096; MRL-truncatable to 1024
-CHUNK_SIZE = 750          # chars (~250 tokens, safely under the embedder's 512 budget)
-CHUNK_OVERLAP = 80        # so a needle on a boundary isn't orphaned
-MAX_CHUNKS = 400          # per source object (bounds pathological mega-objects)
+EMBED_DIM = _env_int("MANNAMINNE_EMBED_DIM", 1024)  # 8B native=4096; MRL-truncatable to 1024
+EMBED_TIMEOUT = _env_float("MANNAMINNE_EMBED_TIMEOUT", 45.0)
+EMBED_PROBE_TIMEOUT = _env_float("MANNAMINNE_EMBED_PROBE_TIMEOUT", 5.0)
+EMBED_BATCH_SIZE = _env_int("MANNAMINNE_EMBED_BATCH_SIZE", 4)
+EMBED_WORKERS = _env_int("MANNAMINNE_EMBED_WORKERS", 2)
+EMBED_SELECT_LIMIT = _env_int("MANNAMINNE_EMBED_SELECT_LIMIT", 500)
+EMBED_MAX_CHARS = _env_int("MANNAMINNE_EMBED_MAX_CHARS", 750)
+CHUNK_SIZE = _env_int("MANNAMINNE_CHUNK_SIZE", 750)          # chars (~250 tokens for prose)
+CHUNK_OVERLAP = _env_int("MANNAMINNE_CHUNK_OVERLAP", 80)     # keeps boundary needles visible
+MAX_CHUNKS = _env_int("MANNAMINNE_MAX_CHUNKS", 400)          # per non-doc source object
+MAX_DOC_CHUNKS = _env_int("MANNAMINNE_MAX_DOC_CHUNKS", 1200)
+SEARCH_KEYWORD_LIMIT = _env_int("MANNAMINNE_SEARCH_KEYWORD_LIMIT", 80)
+SEARCH_SEMANTIC_LIMIT = _env_int("MANNAMINNE_SEARCH_SEMANTIC_LIMIT", 80)
+HNSW_EF_SEARCH = _env_int("MANNAMINNE_HNSW_EF_SEARCH", 100)
+RRF_K = _env_int("MANNAMINNE_RRF_K", 60)
+QUERY_INSTRUCTION = os.environ.get(
+    "MANNAMINNE_QUERY_INSTRUCTION",
+    "Given a personal archive search query, retrieve relevant passages, notes, docs, sessions, tasks, or messages that answer it.",
+)
+_EMBED_URL_CACHE = None
 
 # --- DB ---------------------------------------------------------------------
 
@@ -60,17 +92,62 @@ def fix_mojibake(s: str) -> str:
         pass
     return s
 
-def chunk(text: str):
+def chunk(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP,
+          max_chunks: int = MAX_CHUNKS):
     text = text.strip()
     if not text:
         return
     n = len(text)
-    step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+    step = max(1, size - overlap)
     i = idx = 0
-    while i < n and idx < MAX_CHUNKS:
-        yield idx, text[i:i + CHUNK_SIZE]
+    while i < n and idx < max_chunks:
+        yield idx, text[i:i + size]
         i += step
         idx += 1
+
+_MD_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+def chunk_markdown(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP,
+                   max_chunks: int = MAX_DOC_CHUNKS):
+    """Heading-aware markdown chunks. Each section chunk carries its heading path
+    so semantic search can hit a subsection even when the chunk starts mid-body."""
+    text = text.strip()
+    if not text:
+        return
+
+    headings: list[str] = []
+    section_lines: list[str] = []
+    emitted = 0
+
+    def emit_section(path: list[str], lines: list[str]):
+        body = "\n".join(lines).strip()
+        if not body:
+            return
+        prefix = " > ".join(path)
+        prefix_block = f"Heading: {prefix}\n\n" if prefix else ""
+        body_size = max(200, size - len(prefix_block))
+        for _, ch in chunk(body, size=body_size, overlap=overlap, max_chunks=max_chunks):
+            yield f"{prefix_block}{ch}" if prefix_block else ch
+
+    for line in text.splitlines():
+        m = _MD_HEADING.match(line)
+        if m:
+            for ch in emit_section(headings, section_lines):
+                if emitted >= max_chunks:
+                    return
+                yield emitted, ch
+                emitted += 1
+            level = len(m.group(1))
+            title = m.group(2).strip().strip("#").strip()
+            headings = headings[:level - 1] + [title]
+            section_lines = [line]
+        else:
+            section_lines.append(line)
+    for ch in emit_section(headings, section_lines):
+        if emitted >= max_chunks:
+            return
+        yield emitted, ch
+        emitted += 1
 
 def h(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", "replace")).hexdigest()[:16]
@@ -78,9 +155,9 @@ def h(s: str) -> str:
 # --- source discovery (yields chunk rows) -----------------------------------
 # Each row: (id, source_kind, source_id, chunk_idx, project, title, text, created, content_hash)
 
-def _rows(source_kind, source_id, project, title, full, created):
+def _rows(source_kind, source_id, project, title, full, created, chunker=chunk):
     title = (title or "").replace("\x00", "")          # Postgres text rejects NUL (0x00)
-    for idx, ch in chunk(full):
+    for idx, ch in chunker(full):
         ch = ch.replace("\x00", "")
         yield (f"{source_id}#{idx}", source_kind, source_id, idx, project,
                title, ch, created, h(ch))
@@ -175,7 +252,21 @@ def discover_docs():
                 continue
             project = "dotfiles" if str(base).endswith("dotfiles") else Path(f).relative_to(base).parts[0]
             rel = os.path.relpath(f, base)
-            yield from _rows("doc", f"doc:{project}:{rel}", project, Path(f).stem, content, "")
+            yield from _rows("doc", f"doc:{project}:{rel}", project, Path(f).stem, content, "",
+                             chunker=chunk_markdown)
+
+    # Global agent instructions are high-value retrieval context but live outside
+    # the normal docs roots. Index the canonical file only; ~/.codex/AGENTS.md is
+    # a symlink to the same shared guidance on this machine.
+    global_claude = Path(HOME) / ".claude/CLAUDE.md"
+    if global_claude.exists():
+        try:
+            content = global_claude.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            content = ""
+        if content.strip():
+            yield from _rows("doc", "doc:global-claude:CLAUDE.md", "global-claude",
+                             "CLAUDE.md", content, "", chunker=chunk_markdown)
 
 _NOISE = ("<system-reminder>", "This session is being continued", "Caveat:",
           "# CLAUDE.md", "Codebase and user instructions are shown below",
@@ -569,13 +660,66 @@ def _upsert(cur, rows):
 
 # --- embed ------------------------------------------------------------------
 
-def _embed_batch(texts):
+def _embed_urls():
+    if EXPLICIT_EMBED_URL:
+        return [EXPLICIT_EMBED_URL]
+    urls = []
+    for u in (Z4_EMBED_URL, DARWIN_EMBED_URL):
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+def _post_embed(url, texts, timeout):
     body = json.dumps({"input": texts, "model": EMBED_MODEL}).encode()
-    req = urllib.request.Request(EMBED_URL, data=body,
+    req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
     return [d["embedding"][:EMBED_DIM] for d in data["data"]]
+
+def _embed_batch(texts):
+    global _EMBED_URL_CACHE
+    errors = []
+    if EXPLICIT_EMBED_URL:
+        candidates = [EXPLICIT_EMBED_URL]
+    else:
+        # Prefer the Z4 tunnel whenever it is available. Even after a Darwin
+        # fallback, retry Z4 on the next call so a long embed run can migrate
+        # back as soon as the tunnel/server appears.
+        candidates = _embed_urls()
+    for url in candidates:
+        try:
+            timeout = EMBED_TIMEOUT if url == _EMBED_URL_CACHE or EXPLICIT_EMBED_URL else EMBED_PROBE_TIMEOUT
+            out = _post_embed(url, texts, timeout)
+            _EMBED_URL_CACHE = url
+            return out
+        except Exception as e:
+            errors.append(f"{url}: {type(e).__name__}: {e}")
+            if EXPLICIT_EMBED_URL:
+                break
+            if url == _EMBED_URL_CACHE:
+                _EMBED_URL_CACHE = None
+    raise RuntimeError("all embedding endpoints failed: " + " | ".join(errors))
+
+def _embed_query_text(q: str) -> str:
+    # Qwen3 embeddings are instruction-aware on the query side. Documents stay
+    # raw; only the query receives the retrieval task framing.
+    return f"Instruct: {QUERY_INSTRUCTION}\nQuery: {q}"
+
+def _embed_index_text(text: str) -> str:
+    return text[:EMBED_MAX_CHARS]
+
+def _embed_pairs(pair):
+    if not pair:
+        return []
+    try:
+        embs = _embed_batch([_embed_index_text(t) for _, t in pair])
+        return [(pair[i][0], embs[i]) for i in range(len(pair))]
+    except Exception:
+        if len(pair) == 1:
+            return []
+        mid = max(1, len(pair) // 2)
+        return _embed_pairs(pair[:mid]) + _embed_pairs(pair[mid:])
 
 def _vec(v):
     return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
@@ -588,28 +732,21 @@ def cmd_embed(args):
     print(f"embedding: {pending} chunks pending", flush=True)
     done = 0
     while True:
-        cur.execute("SELECT id,text FROM chunks WHERE embedding IS NULL LIMIT 2000")
+        cur.execute("SELECT id,text FROM chunks WHERE embedding IS NULL LIMIT %s", (EMBED_SELECT_LIMIT,))
         rows = cur.fetchall()
         if not rows:
             break
-        # batches of 16 (server --ubatch-size 4096 packs ~16 short inputs/dispatch; low concurrency)
-        pairs = [rows[i:i+16] for i in range(0, len(rows), 16)]
-        def work(pair):
-            try:
-                embs = _embed_batch([t[:CHUNK_SIZE] for _, t in pair])
-                return [(pair[i][0], embs[i]) for i in range(len(pair))]
-            except Exception:
-                out = []
-                for cid, t in pair:                       # one-by-one fallback
-                    try:
-                        out.append((cid, _embed_batch([t[:CHUNK_SIZE]])[0]))
-                    except Exception:
-                        pass
-                return out
-        results = []                                  # low concurrency (4) + big batch-of-16 per req
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            for res in ex.map(work, pairs):
+        pairs = [rows[i:i + EMBED_BATCH_SIZE] for i in range(0, len(rows), EMBED_BATCH_SIZE)]
+        results = []
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=EMBED_WORKERS)
+        try:
+            for res in ex.map(_embed_pairs, pairs):
                 results.extend(res)
+        except KeyboardInterrupt:
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            ex.shutdown(wait=True)
         wrote = len(results)
         if results:                                   # bulk write: psycopg3 pipelines executemany,
             cur.executemany(                          # ~one round-trip vs 2000 (the real bottleneck)
@@ -633,10 +770,26 @@ def cmd_embed(args):
 
 # --- search -----------------------------------------------------------------
 
-def cmd_search(args):
-    q = " ".join(args.query)
-    scope = _scope(args)
-    conn = load_conn()
+def _rrf(rank: int, k: int = RRF_K) -> float:
+    return 1.0 / (k + rank)
+
+def _fuse_ranked(results, limit: int):
+    for x in results.values():
+        score = 0.0
+        if x.get("kw_rank"):
+            score += 1.6 * _rrf(x["kw_rank"])
+        if x.get("sem_rank"):
+            score += 1.0 * _rrf(x["sem_rank"])
+        if x.get("exact"):
+            score += 0.02
+        x["score"] = score
+    return sorted(results.values(),
+                  key=lambda x: (x.get("score", 0.0), x.get("sem", 0.0)),
+                  reverse=True)[:limit]
+
+def search_results(q: str, scope=None, keyword=False, limit=12, conn=None):
+    owned = conn is None
+    conn = conn or load_conn()
     cur = conn.cursor()
     where_scope = ""
     params_scope = []
@@ -654,31 +807,45 @@ def cmd_search(args):
             FROM chunks
             WHERE (tsv @@ plainto_tsquery('simple',%s) OR text ILIKE %s){where_scope}
             ORDER BY (text ILIKE %s) DESC, ts_rank(tsv, plainto_tsquery('simple',%s)) DESC
-            LIMIT 60""",
-        [f"%{q}%", q, q, f"%{q}%", *params_scope, f"%{q}%", q])
-    for r in cur.fetchall():
+            LIMIT %s""",
+        [f"%{q}%", q, q, f"%{q}%", *params_scope, f"%{q}%", q, SEARCH_KEYWORD_LIMIT])
+    for rank, r in enumerate(cur.fetchall(), 1):
         kwscore = (0.5 if r[6] else 0.3) + min(0.2, float(r[7] or 0))
-        results[r[0]] = {"r": r[:6], "kw": True, "sem": 0.0, "kwscore": kwscore}
+        results[r[0]] = {"r": r[:6], "kw": True, "sem": 0.0, "kwscore": kwscore,
+                         "exact": bool(r[6]), "kw_rank": rank}
     # 2) semantic layer (if embeddings exist + embedder reachable)
-    if not args.keyword:
+    if not keyword:
         try:
-            qe = _vec(_embed_batch([q])[0])
+            qe = _vec(_embed_batch([_embed_query_text(q)])[0])
+            try:
+                cur.execute(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}")
+            except Exception:
+                pass
             cur.execute(
                 f"""SELECT id,source_kind,project,title,left(text,200),created,
                            1-(embedding<=>%s::vector) AS sem FROM chunks
                     WHERE embedding IS NOT NULL{where_scope}
-                    ORDER BY embedding<=>%s::vector LIMIT 40""",
-                [qe, *params_scope, qe])
-            for r in cur.fetchall():
+                    ORDER BY embedding<=>%s::vector LIMIT %s""",
+                [qe, *params_scope, qe, SEARCH_SEMANTIC_LIMIT])
+            for rank, r in enumerate(cur.fetchall(), 1):
                 rid = r[0]
                 if rid in results:
                     results[rid]["sem"] = float(r[6])
+                    results[rid]["sem_rank"] = rank
                 else:
-                    results[rid] = {"r": r[:6], "kw": False, "sem": float(r[6]), "kwscore": 0.0}
+                    results[rid] = {"r": r[:6], "kw": False, "sem": float(r[6]),
+                                    "kwscore": 0.0, "sem_rank": rank}
         except Exception as e:
             print(f"(semantic layer skipped: {e})", file=sys.stderr)
-    ranked = sorted(results.values(),
-                    key=lambda x: x.get("kwscore", 0.0) + x["sem"], reverse=True)[:args.limit]
+    ranked = _fuse_ranked(results, limit)
+    if owned:
+        conn.close()
+    return ranked
+
+def cmd_search(args):
+    q = " ".join(args.query)
+    scope = _scope(args)
+    ranked = search_results(q, scope=scope, keyword=args.keyword, limit=args.limit)
     if not ranked:
         print("No results."); return
     tag = {"session": "\033[36m[session]", "doc": "\033[33m[doc]", "messenger": "\033[35m[msgr]",
@@ -691,6 +858,77 @@ def cmd_search(args):
         print(f"{i}. {tag.get(r[1],'[?]')}\033[0m \033[1m{r[3]}\033[0m  "
               f"\033[2m({r[2]}, sem={x['sem']:.2f}{', '+r[5] if r[5] else ''})\033[0m{kw}")
         print(f"   \033[2m{(r[4] or '').replace(chr(10),' ')[:180]}\033[0m")
+
+def _result_blob(result) -> str:
+    return " ".join(str(x or "") for x in result["r"]).lower()
+
+def _case_scope(case):
+    scope = case.get("scope")
+    if isinstance(scope, str):
+        return [scope]
+    if isinstance(scope, list):
+        return scope
+    return None
+
+def _case_expectations(case):
+    exp = case.get("must_match") or case.get("expected") or []
+    if isinstance(exp, (str, dict)):
+        return [exp]
+    return exp
+
+def _expectation_matches(result, expected) -> bool:
+    blob = _result_blob(result)
+    if isinstance(expected, str):
+        return expected.lower() in blob
+    if isinstance(expected, dict):
+        checks = []
+        if expected.get("contains"):
+            checks.append(str(expected["contains"]).lower() in blob)
+        field_map = {"id": 0, "source_kind": 1, "project": 2, "title": 3, "text": 4, "created": 5}
+        for key, idx in field_map.items():
+            if expected.get(key):
+                checks.append(str(expected[key]).lower() in str(result["r"][idx] or "").lower())
+        return bool(checks) and all(checks)
+    return False
+
+def _hit_rank(results, expectations):
+    for i, r in enumerate(results, 1):
+        if any(_expectation_matches(r, e) for e in expectations):
+            return i
+    return None
+
+def cmd_eval(args):
+    path = Path(args.file)
+    cases = json.loads(path.read_text(encoding="utf-8"))
+    conn = load_conn()
+    rows = []
+    hits = 0
+    rr_sum = 0.0
+    for case in cases:
+        q = case["query"]
+        expectations = _case_expectations(case)
+        ranked = search_results(q, scope=_case_scope(case), keyword=args.keyword,
+                                limit=args.k, conn=conn)
+        rank = _hit_rank(ranked, expectations)
+        hit = rank is not None
+        hits += 1 if hit else 0
+        rr_sum += (1.0 / rank) if rank else 0.0
+        rows.append({"query": q, "hit": hit, "rank": rank,
+                     "top": [r["r"][3] for r in ranked[:3]]})
+    conn.close()
+    summary = {"cases": len(cases), f"recall@{args.k}": hits / len(cases) if cases else 0.0,
+               "mrr": rr_sum / len(cases) if cases else 0.0, "rows": rows}
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+    print(f"eval: {summary['cases']} cases  recall@{args.k}={summary[f'recall@{args.k}']:.2f}  mrr={summary['mrr']:.2f}")
+    for row in rows:
+        mark = "ok" if row["hit"] else "MISS"
+        rank = row["rank"] if row["rank"] is not None else "-"
+        print(f"  {mark:4} rank={rank:>2}  {row['query']}")
+        if args.show_top or not row["hit"]:
+            for title in row["top"]:
+                print(f"       top: {title}")
 
 def cmd_stats(args):
     conn = load_conn(); cur = conn.cursor()
@@ -731,7 +969,7 @@ def _add_search_args(sp):
 
 def main():
     argv = sys.argv[1:]
-    cmds = {"ingest", "embed", "stats", "search"}
+    cmds = {"ingest", "embed", "stats", "search", "eval"}
     if not argv or argv[0] not in cmds:
         sp = argparse.ArgumentParser(prog="mannaminne")
         _add_search_args(sp)
@@ -752,6 +990,14 @@ def main():
     elif cmd == "search":
         sp = argparse.ArgumentParser(); _add_search_args(sp)
         cmd_search(sp.parse_args(rest))
+    elif cmd == "eval":
+        sp = argparse.ArgumentParser()
+        sp.add_argument("--file", default=str(Path(__file__).resolve().parents[1] / "eval/golden_queries.json"))
+        sp.add_argument("-k", type=int, default=10)
+        sp.add_argument("--keyword", action="store_true")
+        sp.add_argument("--json", action="store_true")
+        sp.add_argument("--show-top", action="store_true")
+        cmd_eval(sp.parse_args(rest))
 
 if __name__ == "__main__":
     main()

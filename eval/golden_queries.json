@@ -1,0 +1,37 @@
+[
+  {
+    "query": "local codebase vector search embeddings 2024 Ruby Pinecone GalaxyBrain",
+    "must_match": [
+      "Ruby Script for Code Embeddings",
+      "Embeddings, Pinecone, Error Handling",
+      "GalaxyBrain"
+    ]
+  },
+  {
+    "query": "Z4 embedder backlog complete HNSW mannaminne chunks_emb_hnsw",
+    "scope": "doc",
+    "must_match": [
+      "z4_local_model_strategy_cross_project_2026_06_11",
+      "personal_archives_semantic_search_2026_06_10",
+      "Z4 embedder"
+    ]
+  },
+  {
+    "query": "global CLAUDE.md mannaminne canonical personal life corpus search",
+    "scope": "doc",
+    "must_match": [
+      {
+        "project": "global-claude",
+        "title": "CLAUDE.md"
+      }
+    ]
+  },
+  {
+    "query": "Kaus causal inference Tom Everitt career evidence",
+    "must_match": [
+      "causal",
+      "Tom",
+      "jr51815"
+    ]
+  }
+]
