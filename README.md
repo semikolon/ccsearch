@@ -82,9 +82,13 @@ batch does not poison the whole pending set.
 
 Search is hybrid:
 
-1. Keyword candidates from FTS/trigram.
+1. Keyword candidates from layered Postgres FTS:
+   exact phrase for short queries, strict all-term FTS, then small per-term
+   recall probes for useful non-filler terms.
 2. Semantic candidates from pgvector.
-3. Reciprocal-rank fusion combines the two lists, with a small exact-match boost.
+3. Reciprocal-rank fusion combines the layers, with a small exact-match boost.
+4. Final results are de-duplicated by source object so one long conversation or
+   doc cannot fill the whole first page with adjacent chunks.
 
 The query embedding uses a Qwen3 instruction prefix; stored document chunks stay
 plain text.
@@ -99,9 +103,9 @@ mannaminne eval --keyword
 mannaminne eval -k 20 --json
 ```
 
-The eval command reports recall@k and MRR against the live DB. It is meant as a
-small regression harness before changing chunking, fusion, model, or storage
-settings.
+The eval command reports recall@k, MRR, average latency, and p95 latency against
+the live DB. It is meant as a small regression harness before changing chunking,
+fusion, model, or storage settings.
 
 ## Tests
 
@@ -119,6 +123,8 @@ Current tests cover:
 - Z4-first endpoint preference with Darwin fallback
 - recursive embedding batch split
 - rank fusion
+- query term pruning
+- source de-duplication
 - eval expectation matching
 
 ## Setup

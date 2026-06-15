@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """mannaminne v2 — full-corpus search over the personal life-corpus, backed by
-Postgres + pgvector on Darwin.
+Postgres + pgvector.
 
 Sources (fully chunked, no truncation): CC session transcripts (noise-filtered),
 project/infra docs, Facebook Messenger, AI-chat archives (ChatGPT + Claude),
 Simplenote notes. Postgres FTS (tsvector + trigram) is the guaranteed
-any-exact-needle keyword layer; pgvector (Qwen3-Embedding-4B via the Darwin
-embedder) is the semantic layer.
+keyword layer; pgvector (Qwen3-Embedding-4B, Z4-first with Darwin fallback) is
+the semantic layer.
 
 Subcommands:
   ingest   discover + chunk + upsert all sources (incremental, hash-based)
@@ -57,6 +57,9 @@ MAX_CHUNKS = _env_int("MANNAMINNE_MAX_CHUNKS", 400)          # per non-doc sourc
 MAX_DOC_CHUNKS = _env_int("MANNAMINNE_MAX_DOC_CHUNKS", 1200)
 SEARCH_KEYWORD_LIMIT = _env_int("MANNAMINNE_SEARCH_KEYWORD_LIMIT", 80)
 SEARCH_SEMANTIC_LIMIT = _env_int("MANNAMINNE_SEARCH_SEMANTIC_LIMIT", 80)
+SEARCH_EXACT_MAX_TERMS = _env_int("MANNAMINNE_SEARCH_EXACT_MAX_TERMS", 5)
+SEARCH_SOFT_TERM_LIMIT = _env_int("MANNAMINNE_SEARCH_SOFT_TERM_LIMIT", 12)
+SEARCH_SOFT_PER_TERM_LIMIT = _env_int("MANNAMINNE_SEARCH_SOFT_PER_TERM_LIMIT", 12)
 HNSW_EF_SEARCH = _env_int("MANNAMINNE_HNSW_EF_SEARCH", 100)
 RRF_K = _env_int("MANNAMINNE_RRF_K", 60)
 QUERY_INSTRUCTION = os.environ.get(
@@ -770,22 +773,113 @@ def cmd_embed(args):
 
 # --- search -----------------------------------------------------------------
 
+_TERM_RE = re.compile(r"[a-z0-9]+")
+_QUERY_STOP_TERMS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "but", "by", "can", "did",
+    "do", "does", "for", "from", "had", "has", "have", "how", "i", "in",
+    "is", "it", "me", "my", "of", "on", "or", "our", "that", "the", "this",
+    "to", "was", "were", "what", "when", "where", "which", "who", "why",
+    "said", "say", "with", "you",
+}
+_SOFT_QUERY_STOP_TERMS = _QUERY_STOP_TERMS | {
+    "archive", "find", "local", "look", "remember", "search", "semantic",
+}
+
+def _query_terms(q: str, limit: int = SEARCH_SOFT_TERM_LIMIT) -> list[str]:
+    terms: list[str] = []
+    seen = set()
+    for term in _TERM_RE.findall(q.lower()):
+        if term in _QUERY_STOP_TERMS or len(term) < 2:
+            continue
+        if term not in seen:
+            terms.append(term)
+            seen.add(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+def _soft_terms(q: str) -> list[str]:
+    terms = [t for t in _query_terms(q) if t not in _SOFT_QUERY_STOP_TERMS]
+    return terms or _query_terms(q)
+
+def _should_exact_phrase(q: str) -> bool:
+    return 0 < len(_query_terms(q, limit=SEARCH_EXACT_MAX_TERMS + 1)) <= SEARCH_EXACT_MAX_TERMS
+
 def _rrf(rank: int, k: int = RRF_K) -> float:
     return 1.0 / (k + rank)
 
 def _fuse_ranked(results, limit: int):
     for x in results.values():
-        score = 0.0
-        if x.get("kw_rank"):
+        score = x.get("kw_rrf", 0.0)
+        if x.get("kw_rank") and not x.get("kw_rrf"):
             score += 1.6 * _rrf(x["kw_rank"])
         if x.get("sem_rank"):
             score += 1.0 * _rrf(x["sem_rank"])
         if x.get("exact"):
             score += 0.02
         x["score"] = score
-    return sorted(results.values(),
-                  key=lambda x: (x.get("score", 0.0), x.get("sem", 0.0)),
-                  reverse=True)[:limit]
+    ranked = sorted(results.values(),
+                    key=lambda x: (x.get("score", 0.0), x.get("sem", 0.0)),
+                    reverse=True)
+    out = []
+    seen_sources = set()
+    for x in ranked:
+        source_id = str(x["r"][0]).rsplit("#", 1)[0]
+        if source_id in seen_sources:
+            continue
+        seen_sources.add(source_id)
+        out.append(x)
+        if len(out) >= limit:
+            break
+    return out
+
+def _add_keyword_result(results, row, rank: int, weight: float, exact: bool = False):
+    rid = row[0]
+    if rid not in results:
+        results[rid] = {"r": row[:6], "kw": True, "sem": 0.0, "kwscore": 0.0}
+    x = results[rid]
+    x["kw"] = True
+    x["kw_rrf"] = x.get("kw_rrf", 0.0) + weight * _rrf(rank)
+    x["kw_rank"] = min(rank, x.get("kw_rank", rank))
+    x["kwscore"] = max(float(row[6] or 0.0) if len(row) > 6 else 0.0, x.get("kwscore", 0.0))
+    x["exact"] = bool(x.get("exact") or exact)
+
+def _keyword_results(cur, q: str, where_scope: str, params_scope: list):
+    results = {}
+    if _should_exact_phrase(q):
+        cur.execute(
+            f"""SELECT id,source_kind,project,title,left(text,200),created,1.0 AS rank
+                FROM chunks
+                WHERE text ILIKE %s{where_scope}
+                ORDER BY length(text) ASC
+                LIMIT %s""",
+            [f"%{q}%", *params_scope, min(SEARCH_KEYWORD_LIMIT, 25)])
+        for rank, r in enumerate(cur.fetchall(), 1):
+            _add_keyword_result(results, r, rank, weight=2.4, exact=True)
+
+    cur.execute(
+        f"""SELECT id,source_kind,project,title,left(text,200),created,
+                   ts_rank(tsv, plainto_tsquery('simple',%s)) AS rank
+            FROM chunks
+            WHERE tsv @@ plainto_tsquery('simple',%s){where_scope}
+            ORDER BY ts_rank(tsv, plainto_tsquery('simple',%s)) DESC
+            LIMIT %s""",
+        [q, q, *params_scope, q, SEARCH_KEYWORD_LIMIT])
+    for rank, r in enumerate(cur.fetchall(), 1):
+        _add_keyword_result(results, r, rank, weight=1.6)
+
+    for term in _soft_terms(q):
+        cur.execute(
+            f"""SELECT id,source_kind,project,title,left(text,200),created,
+                       ts_rank(tsv, to_tsquery('simple',%s)) AS rank
+                FROM chunks
+                WHERE tsv @@ to_tsquery('simple',%s){where_scope}
+                ORDER BY ts_rank(tsv, to_tsquery('simple',%s)) DESC
+                LIMIT %s""",
+            [term, term, *params_scope, term, SEARCH_SOFT_PER_TERM_LIMIT])
+        for rank, r in enumerate(cur.fetchall(), 1):
+            _add_keyword_result(results, r, rank, weight=0.35)
+    return results
 
 def search_results(q: str, scope=None, keyword=False, limit=12, conn=None):
     owned = conn is None
@@ -796,23 +890,9 @@ def search_results(q: str, scope=None, keyword=False, limit=12, conn=None):
     if scope:
         where_scope = " AND source_kind = ANY(%s)"
         params_scope = [scope]
-    results = {}
-    # 1) keyword layer (guaranteed any-needle: FTS + trigram substring), no GPU.
-    #    Rank exact-phrase (ILIKE) matches first, then ts_rank — so a specific
-    #    needle outranks incidental token matches even before embeddings exist.
-    cur.execute(
-        f"""SELECT id,source_kind,project,title,left(text,200),created,
-                   (text ILIKE %s) AS exact,
-                   ts_rank(tsv, plainto_tsquery('simple',%s)) AS rank
-            FROM chunks
-            WHERE (tsv @@ plainto_tsquery('simple',%s) OR text ILIKE %s){where_scope}
-            ORDER BY (text ILIKE %s) DESC, ts_rank(tsv, plainto_tsquery('simple',%s)) DESC
-            LIMIT %s""",
-        [f"%{q}%", q, q, f"%{q}%", *params_scope, f"%{q}%", q, SEARCH_KEYWORD_LIMIT])
-    for rank, r in enumerate(cur.fetchall(), 1):
-        kwscore = (0.5 if r[6] else 0.3) + min(0.2, float(r[7] or 0))
-        results[r[0]] = {"r": r[:6], "kw": True, "sem": 0.0, "kwscore": kwscore,
-                         "exact": bool(r[6]), "kw_rank": rank}
+    # 1) keyword layer, no GPU. Exact phrase is intentionally limited to short
+    #    queries; long natural-language queries are better served by FTS layers.
+    results = _keyword_results(cur, q, where_scope, params_scope)
     # 2) semantic layer (if embeddings exist + embedder reachable)
     if not keyword:
         try:
@@ -897,6 +977,13 @@ def _hit_rank(results, expectations):
             return i
     return None
 
+def _pctl(values, pct: float) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * pct))))
+    return vals[idx]
+
 def cmd_eval(args):
     path = Path(args.file)
     cases = json.loads(path.read_text(encoding="utf-8"))
@@ -904,28 +991,38 @@ def cmd_eval(args):
     rows = []
     hits = 0
     rr_sum = 0.0
+    latencies = []
     for case in cases:
         q = case["query"]
         expectations = _case_expectations(case)
+        t0 = time.perf_counter()
         ranked = search_results(q, scope=_case_scope(case), keyword=args.keyword,
                                 limit=args.k, conn=conn)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        latencies.append(latency_ms)
         rank = _hit_rank(ranked, expectations)
         hit = rank is not None
         hits += 1 if hit else 0
         rr_sum += (1.0 / rank) if rank else 0.0
         rows.append({"query": q, "hit": hit, "rank": rank,
+                     "latency_ms": round(latency_ms, 1),
                      "top": [r["r"][3] for r in ranked[:3]]})
     conn.close()
     summary = {"cases": len(cases), f"recall@{args.k}": hits / len(cases) if cases else 0.0,
-               "mrr": rr_sum / len(cases) if cases else 0.0, "rows": rows}
+               "mrr": rr_sum / len(cases) if cases else 0.0,
+               "latency_ms_avg": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+               "latency_ms_p95": round(_pctl(latencies, 0.95), 1),
+               "rows": rows}
     if args.json:
         print(json.dumps(summary, indent=2))
         return
-    print(f"eval: {summary['cases']} cases  recall@{args.k}={summary[f'recall@{args.k}']:.2f}  mrr={summary['mrr']:.2f}")
+    print(f"eval: {summary['cases']} cases  recall@{args.k}={summary[f'recall@{args.k}']:.2f}  "
+          f"mrr={summary['mrr']:.2f}  avg={summary['latency_ms_avg']:.1f}ms  "
+          f"p95={summary['latency_ms_p95']:.1f}ms")
     for row in rows:
         mark = "ok" if row["hit"] else "MISS"
         rank = row["rank"] if row["rank"] is not None else "-"
-        print(f"  {mark:4} rank={rank:>2}  {row['query']}")
+        print(f"  {mark:4} rank={rank:>2} {row['latency_ms']:>7.1f}ms  {row['query']}")
         if args.show_top or not row["hit"]:
             for title in row["top"]:
                 print(f"       top: {title}")

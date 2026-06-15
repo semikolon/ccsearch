@@ -121,12 +121,33 @@ class RankingAndEvalTests(unittest.TestCase):
     def row(self, title):
         return ("id", "doc", "proj", title, "text", "")
 
+    def source_row(self, source_id, title):
+        return (f"{source_id}#0", "doc", "proj", title, "text", "")
+
+    def test_query_terms_drop_filler_and_soft_terms_drop_generic_search_words(self):
+        self.assertEqual(
+            m._query_terms("what did I say about local codebase vector search?"),
+            ["local", "codebase", "vector", "search"],
+        )
+        self.assertEqual(
+            m._soft_terms("local codebase vector search"),
+            ["codebase", "vector"],
+        )
+
     def test_fusion_keeps_exact_keyword_above_semantic_only(self):
         ranked = m._fuse_ranked({
             "sem": {"r": self.row("semantic generic"), "kw": False, "sem": 0.99, "sem_rank": 1},
             "kw": {"r": self.row("exact needle"), "kw": True, "sem": 0.2, "kw_rank": 1, "exact": True},
         }, limit=2)
         self.assertEqual(ranked[0]["r"][3], "exact needle")
+
+    def test_fusion_deduplicates_source_objects(self):
+        ranked = m._fuse_ranked({
+            "doc:one#0": {"r": self.source_row("doc:one", "first chunk"), "kw": True, "kw_rrf": 0.2},
+            "doc:one#1": {"r": self.source_row("doc:one", "second chunk"), "kw": True, "kw_rrf": 0.1},
+            "doc:two#0": {"r": self.source_row("doc:two", "other source"), "kw": True, "kw_rrf": 0.05},
+        }, limit=3)
+        self.assertEqual([r["r"][3] for r in ranked], ["first chunk", "other source"])
 
     def test_expectation_matching_supports_strings_and_fields(self):
         result = {"r": ("id:1", "doc", "dotfiles", "CLAUDE.md", "mannaminne canonical", "")}
